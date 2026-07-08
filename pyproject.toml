@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "skillwright-mcp"
+version = "0.1.0"
+description = "Persistent, deterministic browser skills built on Microsoft's Playwright MCP server."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Abdullah Alzeiby" }]
+keywords = ["mcp", "model-context-protocol", "playwright", "browser-automation", "agents"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = [
+  "aiosqlite>=0.21,<1",
+  "mcp>=2.0,<3",
+  "pydantic>=2.11,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/alzeiby/skillwright-mcp"
+Repository = "https://github.com/alzeiby/skillwright-mcp"
+Issues = "https://github.com/alzeiby/skillwright-mcp/issues"
+Documentation = "https://github.com/alzeiby/skillwright-mcp/tree/main/docs"
+Security = "https://github.com/alzeiby/skillwright-mcp/blob/main/SECURITY.md"
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.17,<2",
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.1,<2",
+  "ruff>=0.12,<1",
+]
+
+[project.scripts]
+skillwright-mcp = "skillwright_mcp.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/skillwright_mcp"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["skillwright_mcp"]
