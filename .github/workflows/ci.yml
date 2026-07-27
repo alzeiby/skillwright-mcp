@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.21"
+          enable-cache: true
+      - run: uv sync --frozen --all-extras
+      - run: uv run ruff check src tests
+      - run: uv run mypy src/skillwright_mcp
+      - run: uv run skillwright-mcp --help
+
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.21"
+          enable-cache: true
+      - run: uv sync --frozen --all-extras
+      - run: uv run pytest -q --ignore=tests/test_integration_browser.py
+
+  browser-integration:
+    runs-on: ubuntu-latest
+    env:
+      SKILLWRIGHT_PLAYWRIGHT_COMMAND: playwright-mcp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.21"
+          enable-cache: true
+      - run: uv sync --frozen --all-extras
+      - name: Install official Playwright MCP and Chrome
+        shell: bash
+        run: |
+          npm install --global --omit=dev @playwright/mcp@0.0.81
+          npm_root="$(npm root --global)"
+          playwright_cli="$npm_root/@playwright/mcp/node_modules/playwright/cli.js"
+          test -f "$playwright_cli"
+          node "$playwright_cli" install --with-deps chrome
+          command -v playwright-mcp
+      - name: Disable Chrome sandbox for local act runner
+        if: ${{ env.ACT == 'true' }}
+        shell: bash
+        run: |
+          upstream="$(command -v playwright-mcp)"
+          wrapper="$RUNNER_TEMP/skillwright-playwright-mcp"
+          printf '#!/usr/bin/env bash\nexec %q --no-sandbox "$@"\n' "$upstream" > "$wrapper"
+          chmod +x "$wrapper"
+          echo "SKILLWRIGHT_PLAYWRIGHT_COMMAND=$wrapper" >> "$GITHUB_ENV"
+      - name: Real browser record, replay, failure, repair, and versioning
+        run: uv run pytest -q tests/test_integration_browser.py
