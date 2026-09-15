@@ -166,6 +166,33 @@ class SkillPermissionRow(Base):
     )
 
 
+class SkillSecretBindingRow(Base):
+    __tablename__ = "skill_secret_bindings"
+    __table_args__ = (
+        UniqueConstraint("skill_id", "input_name", name="uq_skill_secret_binding"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    skill_id: Mapped[str] = mapped_column(
+        ForeignKey("skills.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    input_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), default="env", nullable=False)
+    secret_ref: Mapped[str] = mapped_column(String(128), nullable=False)
+    updated_by_principal_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "principals.id",
+            ondelete="SET NULL",
+            name="fk_skill_secret_bindings_updated_by_principal_id",
+        ),
+        nullable=True,
+        index=True,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+
+
 class WorkflowVersionRow(Base):
     __tablename__ = "workflow_versions"
     __table_args__ = (
@@ -227,9 +254,7 @@ class RunRow(Base):
         DateTime(timezone=True), default=_now, server_default=func.now(), nullable=False
     )
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
-    started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_now, nullable=False
-    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
@@ -489,6 +514,79 @@ class Database:
                 .order_by(SkillPermissionRow.principal_id, SkillPermissionRow.permission)
             )
             return result.all()
+
+    async def bind_skill_secret(
+        self,
+        *,
+        skill_id: str,
+        input_name: str,
+        provider: str = "env",
+        secret_ref: str,
+        updated_by_principal_id: str | None,
+    ) -> SkillSecretBindingRow:
+        async with self.sessions.begin() as session:
+            row = await session.scalar(
+                select(SkillSecretBindingRow)
+                .where(
+                    SkillSecretBindingRow.skill_id == skill_id,
+                    SkillSecretBindingRow.input_name == input_name,
+                )
+                .with_for_update()
+            )
+            if row is None:
+                row = SkillSecretBindingRow(
+                    skill_id=skill_id,
+                    input_name=input_name,
+                    provider=provider,
+                    secret_ref=secret_ref,
+                    updated_by_principal_id=updated_by_principal_id,
+                )
+                session.add(row)
+            else:
+                row.provider = provider
+                row.secret_ref = secret_ref
+                row.updated_by_principal_id = updated_by_principal_id
+                row.updated_at = _now()
+            await session.flush()
+            return row
+
+    async def unbind_skill_secret(self, *, skill_id: str, input_name: str) -> bool:
+        async with self.sessions.begin() as session:
+            row = await session.scalar(
+                select(SkillSecretBindingRow).where(
+                    SkillSecretBindingRow.skill_id == skill_id,
+                    SkillSecretBindingRow.input_name == input_name,
+                )
+            )
+            if row is None:
+                return False
+            await session.delete(row)
+            return True
+
+    async def skill_secret_bindings(self, skill_id: str) -> Sequence[SkillSecretBindingRow]:
+        async with self.sessions() as session:
+            result = await session.scalars(
+                select(SkillSecretBindingRow)
+                .where(SkillSecretBindingRow.skill_id == skill_id)
+                .order_by(SkillSecretBindingRow.input_name)
+            )
+            return result.all()
+
+    async def skill_secret_binding(
+        self,
+        skill_id: str,
+        input_name: str,
+    ) -> SkillSecretBindingRow | None:
+        async with self.sessions() as session:
+            return cast(
+                SkillSecretBindingRow | None,
+                await session.scalar(
+                    select(SkillSecretBindingRow).where(
+                        SkillSecretBindingRow.skill_id == skill_id,
+                        SkillSecretBindingRow.input_name == input_name,
+                    )
+                ),
+            )
 
     async def list_skills_for_principal(self, principal: PrincipalRow) -> Sequence[SkillRow]:
         if principal.role == "admin":
@@ -762,6 +860,7 @@ class Database:
                 outputs={},
                 repair_overrides={},
                 attempt_count=1 if status == "running" else 0,
+                started_at=_now() if status == "running" else None,
             )
             session.add(row)
             try:
@@ -829,6 +928,7 @@ class Database:
                     status="running",
                     worker_id=worker_id,
                     heartbeat_at=now,
+                    started_at=func.coalesce(RunRow.started_at, now),
                     attempt_count=RunRow.attempt_count + 1,
                     failure_context=None,
                 )

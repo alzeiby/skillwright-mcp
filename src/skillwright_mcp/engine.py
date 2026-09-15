@@ -10,7 +10,21 @@ from uuid import uuid4
 from .auth import AuthorizationError, AuthorizationService
 from .browser import BrowserActionResult, BrowserController
 from .db import Database, RepairRow, RunRow, SkillRow, WorkflowVersionRow
+from .secrets import (
+    Redactor,
+    SecretResolutionError,
+    SecretResolver,
+    secret_binding_from_marker,
+    secret_marker,
+)
 from .snapshot import PageSnapshot, SnapshotElement, parse_snapshot
+from .telemetry import (
+    queue_wait_finished,
+    run_finished,
+    run_started,
+    tracer,
+    workflow_step_finished,
+)
 from .workflow import (
     AssertStep,
     ClickStep,
@@ -32,10 +46,12 @@ class WorkflowEngine:
         database: Database,
         browser: BrowserController,
         authorization: AuthorizationService | None = None,
+        secret_resolver: SecretResolver | None = None,
     ) -> None:
         self.database = database
         self.browser = browser
         self.authorization = authorization
+        self.secret_resolver = secret_resolver or SecretResolver()
 
     async def run_skill(
         self,
@@ -79,6 +95,34 @@ class WorkflowEngine:
         except ValueError as exc:
             return {"status": "invalid_inputs", "workflow": name, "error": str(exc)}
 
+        secret_bindings = {
+            binding.input_name: binding
+            for binding in await self.database.skill_secret_bindings(skill.id)
+        }
+        for input_name, input_spec in workflow.inputs.items():
+            if not input_spec.secret:
+                continue
+            binding = secret_bindings.get(input_name)
+            if binding is None:
+                return {
+                    "status": "secret_unavailable",
+                    "workflow": name,
+                    "input": input_name,
+                    "reason": "secret_binding_missing",
+                }
+            try:
+                prepared_inputs[input_name] = secret_marker(
+                    binding.secret_ref,
+                    provider=binding.provider,
+                )
+            except ValueError:
+                return {
+                    "status": "secret_unavailable",
+                    "workflow": name,
+                    "input": input_name,
+                    "reason": "secret_binding_invalid",
+                }
+
         run = await self.database.create_run(
             skill=skill,
             version=version_row,
@@ -119,6 +163,14 @@ class WorkflowEngine:
                 "outputs": existing.outputs,
                 "failure_context": existing.failure_context,
             }
+
+        if claimed.started_at is not None:
+            queue_wait_finished(
+                duration_ms=max(
+                    0.0,
+                    (claimed.started_at - claimed.queued_at).total_seconds() * 1000,
+                )
+            )
 
         version_row = await self.database.get_workflow_version_by_id(claimed.workflow_version_id)
         skill = await self.database.get_skill_by_id(claimed.skill_id)
@@ -166,8 +218,29 @@ class WorkflowEngine:
             if index < len(definition["steps"]) and "target" in definition["steps"][index]:
                 definition["steps"][index]["target"] = target
         workflow = WorkflowDefinition.model_validate(definition)
-        variables = dict(claimed.inputs)
-        variables.update(claimed.outputs)
+        try:
+            variables, redactor = self._resolve_run_variables(claimed)
+        except SecretResolutionError:
+            failure = {
+                "status": "failed",
+                "run_id": claimed.id,
+                "reason": "secret_unavailable",
+                "side_effect_state": "not_started",
+            }
+            await self.database.update_run(
+                claimed.id,
+                status="failed",
+                failure_context=failure,
+                finish=True,
+            )
+            await self.database.audit(
+                "skill.run.secret_unavailable",
+                principal_id=claimed.requested_by_principal_id,
+                entity_type="run",
+                entity_id=claimed.id,
+                data={"skill": skill.name},
+            )
+            return failure
         await self.database.audit(
             "skill.run.started",
             principal_id=claimed.requested_by_principal_id,
@@ -180,7 +253,7 @@ class WorkflowEngine:
                 "attempt": claimed.attempt_count,
             },
         )
-        return await self._execute(
+        return await self._run_execution_segment(
             workflow=workflow,
             skill=skill,
             version_row=version_row,
@@ -189,6 +262,7 @@ class WorkflowEngine:
             variables=variables,
             attempt=max(1, claimed.attempt_count),
             worker_id=worker_id,
+            redactor=redactor,
         )
 
     async def request_repair(
@@ -302,6 +376,28 @@ class WorkflowEngine:
                 validation_result=result,
             )
             return result
+
+        try:
+            variables, redactor = self._resolve_run_variables(run)
+        except SecretResolutionError:
+            result = {
+                "status": "failed",
+                "run_id": run.id,
+                "reason": "secret_unavailable",
+                "side_effect_state": "not_started",
+            }
+            await self.database.update_run(
+                run.id,
+                status="failed",
+                failure_context=result,
+                finish=True,
+            )
+            await self.database.complete_repair(
+                repair.id,
+                status="run_incomplete",
+                validation_result=result,
+            )
+            return result
         failure = run.failure_context
         if failure.get("step") != repair.step_index:
             result = {
@@ -321,6 +417,7 @@ class WorkflowEngine:
             source="repair",
             run_id=run.id,
             actor_principal_id=run.requested_by_principal_id,
+            redactor=redactor,
         )
         if not validation_snapshot_result.ok or validation_snapshot_result.result is None:
             result = {
@@ -351,6 +448,7 @@ class WorkflowEngine:
         generated_locator = await self.browser.generate_locator(
             current_element.ref,
             element=current_element.name,
+            redactor=redactor,
         )
         if generated_locator:
             replacement_target = replacement_target.model_copy(
@@ -389,9 +487,7 @@ class WorkflowEngine:
             failure_context=None,
         )
         run.repair_overrides = overrides
-        variables = dict(run.inputs)
-        variables.update(run.outputs)
-        run_result = await self._execute(
+        run_result = await self._run_execution_segment(
             workflow=patched_workflow,
             skill=skill,
             version_row=version_row,
@@ -400,6 +496,7 @@ class WorkflowEngine:
             variables=variables,
             attempt=max(2, run.attempt_count + 1),
             worker_id=worker_id,
+            redactor=redactor,
         )
 
         new_version_id: str | None = None
@@ -510,15 +607,29 @@ class WorkflowEngine:
             if index < len(definition["steps"]) and "target" in definition["steps"][index]:
                 definition["steps"][index]["target"] = target
         workflow = WorkflowDefinition.model_validate(definition)
-        variables = dict(run.inputs)
-        variables.update(run.outputs)
+        try:
+            variables, redactor = self._resolve_run_variables(run)
+        except SecretResolutionError:
+            failure = {
+                "status": "failed",
+                "run_id": run.id,
+                "reason": "secret_unavailable",
+                "side_effect_state": "not_started",
+            }
+            await self.database.update_run(
+                run.id,
+                status="failed",
+                failure_context=failure,
+                finish=True,
+            )
+            return failure
         await self.database.update_run(
             run.id,
             status="running",
             failure_context=None,
             heartbeat=worker_id is not None,
         )
-        return await self._execute(
+        return await self._run_execution_segment(
             workflow=workflow,
             skill=skill,
             version_row=version_row,
@@ -527,7 +638,70 @@ class WorkflowEngine:
             variables=variables,
             attempt=max(1, run.attempt_count),
             worker_id=worker_id,
+            redactor=redactor,
         )
+
+    def _resolve_run_variables(self, run: RunRow) -> tuple[dict[str, Any], Redactor]:
+        variables: dict[str, Any] = {}
+        secret_values: list[str] = []
+        for name, stored_value in run.inputs.items():
+            binding = secret_binding_from_marker(stored_value)
+            if binding is None:
+                variables[name] = stored_value
+                continue
+            provider, reference = binding
+            value = self.secret_resolver.resolve(reference, provider=provider)
+            variables[name] = value
+            secret_values.append(value)
+        variables.update(run.outputs)
+        return variables, Redactor.from_values(secret_values)
+
+    async def _run_execution_segment(
+        self,
+        *,
+        workflow: WorkflowDefinition,
+        skill: SkillRow,
+        version_row: WorkflowVersionRow,
+        run: RunRow,
+        start_index: int,
+        variables: dict[str, Any],
+        attempt: int,
+        worker_id: str | None = None,
+        redactor: Redactor | None = None,
+    ) -> dict[str, Any]:
+        started = perf_counter()
+        status = "failed"
+        run_started()
+        with tracer().start_as_current_span(
+            "skill.run",
+            attributes={
+                "skillwright.run.id": run.id,
+                "skillwright.workflow.version": version_row.version,
+                "skillwright.run.attempt": attempt,
+            },
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
+            try:
+                result = await self._execute(
+                    workflow=workflow,
+                    skill=skill,
+                    version_row=version_row,
+                    run=run,
+                    start_index=start_index,
+                    variables=variables,
+                    attempt=attempt,
+                    worker_id=worker_id,
+                    redactor=redactor,
+                )
+                status = str(result.get("status", "unknown"))
+                span.set_attribute("skillwright.run.status", status)
+                return result
+            finally:
+                run_finished(
+                    status=status,
+                    duration_ms=(perf_counter() - started) * 1000,
+                )
 
     async def _execute(
         self,
@@ -540,6 +714,7 @@ class WorkflowEngine:
         variables: dict[str, Any],
         attempt: int,
         worker_id: str | None = None,
+        redactor: Redactor | None = None,
     ) -> dict[str, Any]:
         outputs = dict(run.outputs)
         for index in range(start_index, len(workflow.steps)):
@@ -640,14 +815,32 @@ class WorkflowEngine:
                         data={"run_id": run.id, "step": index, "operation": step.op},
                     )
                     return context
-            started = perf_counter()
-            execution = await self._execute_step(
-                step,
-                variables,
-                run.id,
-                actor_principal_id=run.requested_by_principal_id,
-            )
-            duration_ms = (perf_counter() - started) * 1000
+            with tracer().start_as_current_span(
+                "workflow.step",
+                attributes={
+                    "skillwright.run.id": run.id,
+                    "skillwright.workflow.step.index": index,
+                    "skillwright.workflow.step.operation": step.op,
+                },
+                record_exception=False,
+                set_status_on_exception=False,
+            ) as span:
+                started = perf_counter()
+                execution = await self._execute_step(
+                    step,
+                    variables,
+                    run.id,
+                    actor_principal_id=run.requested_by_principal_id,
+                    redactor=redactor,
+                )
+                duration_ms = (perf_counter() - started) * 1000
+                execution_status = str(execution.get("status", "unknown"))
+                span.set_attribute("skillwright.workflow.step.status", execution_status)
+                workflow_step_finished(
+                    operation=step.op,
+                    status=execution_status,
+                    duration_ms=duration_ms,
+                )
             if execution["status"] == "repair_required":
                 failure = self._repair_context(
                     run=run,
@@ -759,6 +952,7 @@ class WorkflowEngine:
         run_id: str,
         *,
         actor_principal_id: str | None,
+        redactor: Redactor | None,
     ) -> dict[str, Any]:
         if isinstance(step, NavigateStep):
             action = await self.browser.navigate(
@@ -766,6 +960,7 @@ class WorkflowEngine:
                 source="replay",
                 run_id=run_id,
                 actor_principal_id=actor_principal_id,
+                redactor=redactor,
             )
             return _action_outcome(action, mutating=False)
         if isinstance(step, WaitStep):
@@ -776,6 +971,7 @@ class WorkflowEngine:
                 source="replay",
                 run_id=run_id,
                 actor_principal_id=actor_principal_id,
+                redactor=redactor,
             )
             return _action_outcome(action, mutating=False)
 
@@ -783,6 +979,7 @@ class WorkflowEngine:
             source="replay",
             run_id=run_id,
             actor_principal_id=actor_principal_id,
+            redactor=redactor,
         )
         if not snapshot_action.ok or snapshot_action.result is None:
             return {
@@ -799,6 +996,7 @@ class WorkflowEngine:
                     snapshot,
                     run_id,
                     actor_principal_id=actor_principal_id,
+                    redactor=redactor,
                 )
                 if resolved is None:
                     return {
@@ -815,6 +1013,7 @@ class WorkflowEngine:
                 snapshot,
                 run_id,
                 actor_principal_id=actor_principal_id,
+                redactor=redactor,
             )
             if element is None:
                 return {
@@ -846,6 +1045,7 @@ class WorkflowEngine:
             snapshot,
             run_id,
             actor_principal_id=actor_principal_id,
+            redactor=redactor,
         )
         if element is None:
             return {
@@ -863,6 +1063,7 @@ class WorkflowEngine:
                 source="replay",
                 run_id=run_id,
                 actor_principal_id=actor_principal_id,
+                redactor=redactor,
             )
             outcome = _action_outcome(action, mutating=True)
         elif isinstance(step, FillStep):
@@ -874,6 +1075,7 @@ class WorkflowEngine:
                 source="replay",
                 run_id=run_id,
                 actor_principal_id=actor_principal_id,
+                redactor=redactor,
             )
             outcome = _action_outcome(action, mutating=True)
         elif isinstance(step, SelectStep):
@@ -884,6 +1086,7 @@ class WorkflowEngine:
                 source="replay",
                 run_id=run_id,
                 actor_principal_id=actor_principal_id,
+                redactor=redactor,
             )
             outcome = _action_outcome(action, mutating=True)
         else:  # pragma: no cover - discriminated union keeps this exhaustive
@@ -898,6 +1101,7 @@ class WorkflowEngine:
         run_id: str,
         *,
         actor_principal_id: str | None,
+        redactor: Redactor | None,
     ) -> SnapshotElement | None:
         if target.locator:
             locator_snapshot = await self.browser.snapshot(
@@ -906,6 +1110,7 @@ class WorkflowEngine:
                 source="replay",
                 run_id=run_id,
                 actor_principal_id=actor_principal_id,
+                redactor=redactor,
             )
             if locator_snapshot.ok and locator_snapshot.result is not None:
                 targeted = parse_snapshot(locator_snapshot.result.text)

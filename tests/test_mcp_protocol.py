@@ -5,22 +5,23 @@ from pathlib import Path
 import pytest
 from mcp import Client
 
-from skillwright_mcp.server import mcp
+import skillwright_mcp.server as server_module
+from skillwright_mcp.config import Settings
 
 
 @pytest.mark.asyncio
 async def test_mcp_server_exposes_browser_and_skill_tools(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv(
-        "SKILLWRIGHT_DATABASE_URL",
-        f"sqlite+aiosqlite:///{(tmp_path / 'protocol.db').as_posix()}",
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{(tmp_path / 'protocol.db').as_posix()}",
+        database_auto_create_schema=True,
+        execution_backend="inline",
+        playwright_output_dir=tmp_path / "playwright-output",
     )
-    monkeypatch.setenv("SKILLWRIGHT_DATABASE_AUTO_CREATE_SCHEMA", "true")
-    monkeypatch.setenv("SKILLWRIGHT_EXECUTION_BACKEND", "inline")
-    monkeypatch.setenv("SKILLWRIGHT_PLAYWRIGHT_OUTPUT_DIR", str(tmp_path / "playwright-output"))
+    monkeypatch.setattr(server_module, "_server_settings", settings)
 
-    async with Client(mcp) as client:
+    async with Client(server_module.mcp) as client:
         listed = await client.list_tools()
         names = {tool.name for tool in listed.tools}
         assert {
@@ -28,6 +29,7 @@ async def test_mcp_server_exposes_browser_and_skill_tools(
             "browser_snapshot",
             "browser_click",
             "browser_fill",
+            "browser_fill_secret",
             "browser_select",
             "browser_wait",
             "skill_record_start",
@@ -36,10 +38,15 @@ async def test_mcp_server_exposes_browser_and_skill_tools(
             "skill_list",
             "skill_search",
             "skill_get",
+            "skill_secret_bind",
+            "skill_secret_unbind",
+            "skill_secret_status",
+            "skill_approval_set",
             "skill_run",
             "skill_status",
             "skill_cancel",
             "skill_repair",
+            "skill_approval_decide",
             "skill_versions",
             "skill_rollback",
         } <= names

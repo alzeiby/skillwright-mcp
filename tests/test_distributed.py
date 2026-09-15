@@ -42,11 +42,13 @@ async def test_run_idempotency_claim_and_queued_cancel(tmp_path: Path) -> None:
             idempotency_key="same-request",
         )
         assert duplicate.id == first.id
+        assert first.started_at is None
 
         claimed = await database.claim_run(first.id, "worker-a")
         assert claimed is not None
         assert claimed.worker_id == "worker-a"
         assert claimed.attempt_count == 1
+        assert claimed.started_at is not None
         assert await database.claim_run(first.id, "worker-b") is None
 
         queued = await database.create_run(
@@ -95,6 +97,18 @@ async def test_stale_run_requeues_only_before_mutating_browser_work(tmp_path: Pa
         assert safe_after is not None
         assert safe_after.status == "queued"
         assert safe_after.worker_id is None
+        first_started_at = safe_after.started_at
+        assert first_started_at is not None
+
+        reclaimed = await database.claim_run(safe.id, "replacement-worker")
+        assert reclaimed is not None
+        assert reclaimed.started_at == first_started_at
+        async with database.sessions.begin() as session:
+            await session.execute(
+                update(RunRow)
+                .where(RunRow.id == safe.id)
+                .values(status="cancelled", finished_at=datetime.now(UTC))
+            )
 
         unsafe = await database.create_run(
             skill=skill,

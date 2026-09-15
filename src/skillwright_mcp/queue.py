@@ -4,34 +4,54 @@ import asyncio
 import os
 import socket
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
+from sqlalchemy import select, update
+from taskiq import AsyncTaskiqDecoratedTask
 from taskiq_redis import RedisStreamBroker
 
 from .auth import AuthorizationService
 from .browser import BrowserController
 from .config import Settings
-from .db import Database
+from .db import Database, RunRow
 from .engine import WorkflowEngine
+from .observability import (
+    configure_observability,
+    instrument_taskiq_broker,
+    record_queue_publish,
+)
 from .playwright import PlaywrightMCPClient
+from .telemetry import stale_recovery_recorded
 
 _worker_settings = Settings()
+_EXECUTE_RUN_TASK_NAME = "skillwright.execute_run"
 
-broker = RedisStreamBroker(
-    url=_worker_settings.redis_url,
-    queue_name=_worker_settings.redis_queue_name,
-    consumer_group_name="skillwright-workers",
-)
+
+def create_broker(settings: Settings) -> RedisStreamBroker:
+    return RedisStreamBroker(
+        url=settings.redis_url,
+        queue_name=settings.redis_queue_name,
+        consumer_group_name="skillwright-workers",
+    )
+
+
+broker = create_broker(_worker_settings)
+instrument_taskiq_broker(broker, configure_observability(_worker_settings))
+
+
+class QueuePublishError(RuntimeError):
+    def __init__(self, error_type: str) -> None:
+        super().__init__(error_type)
+        self.error_type = error_type
 
 
 def _worker_id() -> str:
     return f"{socket.gethostname()}:{os.getpid()}:{uuid4()}"
 
 
-@broker.task(task_name="skillwright.execute_run")
-async def execute_run_task(run_id: str) -> dict[str, Any]:
+async def execute_run(run_id: str) -> dict[str, Any]:
     """Execute one persisted run in an isolated Playwright MCP/browser session."""
 
     settings = Settings()
@@ -73,7 +93,6 @@ async def execute_run_task(run_id: str) -> dict[str, Any]:
                 "run_id": run_id,
                 "reason": "worker_exception",
                 "error_type": type(exc).__name__,
-                "error": str(exc),
                 "side_effect_state": "unknown",
             }
             await database.update_run(
@@ -163,23 +182,54 @@ async def _wait_for_intervention(
     }
 
 
+def bind_execute_run_task(
+    task_broker: RedisStreamBroker,
+) -> AsyncTaskiqDecoratedTask[Any, Any]:
+    async def bound_execute_run(run_id: str) -> dict[str, Any]:
+        return await execute_run(run_id)
+
+    return task_broker.task(task_name=_EXECUTE_RUN_TASK_NAME)(bound_execute_run)
+
+
+execute_run_task = bind_execute_run_task(broker)
+
+
 @dataclass(slots=True)
 class RunDispatcher:
     settings: Settings
     database: Database
     engine: WorkflowEngine
+    publisher_broker: RedisStreamBroker | None = None
     _reaper_task: asyncio.Task[None] | None = None
     _broker_started: bool = False
+    _publish_task: AsyncTaskiqDecoratedTask[Any, Any] | None = field(
+        init=False,
+        default=None,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.settings.execution_backend != "redis":
+            return
+        if self.publisher_broker is None:
+            self.publisher_broker = create_broker(self.settings)
+        observability = configure_observability(self.settings)
+        instrument_taskiq_broker(self.publisher_broker, observability)
+        self._publish_task = bind_execute_run_task(self.publisher_broker)
 
     async def start(self) -> None:
-        if self.settings.execution_backend != "redis" or self._broker_started:
+        if self.settings.execution_backend != "redis":
             return
-        await broker.startup()
-        self._broker_started = True
-        self._reaper_task = asyncio.create_task(
-            self._reaper_loop(),
-            name="skillwright-stale-run-reaper",
-        )
+        if self.publisher_broker is None:
+            raise RuntimeError("redis dispatcher has no publisher broker")
+        if self._reaper_task is None:
+            self._reaper_task = asyncio.create_task(
+                self._reaper_loop(),
+                name="skillwright-stale-run-reaper",
+            )
+        if not self._broker_started:
+            await self.publisher_broker.startup()
+            self._broker_started = True
 
     async def close(self) -> None:
         if self._reaper_task is not None:
@@ -188,7 +238,9 @@ class RunDispatcher:
                 await self._reaper_task
             self._reaper_task = None
         if self._broker_started:
-            await broker.shutdown()
+            if self.publisher_broker is None:
+                raise RuntimeError("redis dispatcher lost its publisher broker")
+            await self.publisher_broker.shutdown()
             self._broker_started = False
 
     async def submit(
@@ -216,21 +268,107 @@ class RunDispatcher:
             idempotency_key=idempotency_key,
             requested_by_principal_id=requested_by_principal_id,
         )
-        if prepared["status"] != "queued":
+        if prepared["status"] not in {"queued", "retrying"}:
             return prepared
 
         run_id = str(prepared["run_id"])
         try:
-            task = await execute_run_task.kicker().with_task_id(f"skillwright-run-{run_id}").kiq(
-                run_id
+            task_id = await self._publish_run(
+                run_id,
+                recovered=prepared["status"] == "retrying",
             )
-        except Exception as exc:
+        except QueuePublishError as exc:
             return {
                 **prepared,
                 "status": "queue_unavailable",
-                "queue_error": f"{type(exc).__name__}: {exc}",
+                "queue_error_type": exc.error_type,
             }
-        return {**prepared, "task_id": task.task_id}
+        return {
+            **prepared,
+            "status": "queued",
+            "failure_context": None,
+            "task_id": task_id,
+        }
+
+    async def _send_task(self, run_id: str) -> str:
+        if self._publish_task is None:
+            raise RuntimeError("redis dispatcher has no publisher task")
+        task = await self._publish_task.kicker().with_task_id(f"skillwright-run-{run_id}").kiq(
+            run_id
+        )
+        return task.task_id
+
+    async def _publish_run(self, run_id: str, *, recovered: bool) -> str:
+        try:
+            task_id = await self._send_task(run_id)
+        except Exception as exc:
+            error_type = type(exc).__name__
+            await self._mark_publish_failed(run_id, error_type)
+            record_queue_publish("failure")
+            raise QueuePublishError(error_type) from exc
+
+        if recovered:
+            await self._clear_publish_failure(run_id)
+            record_queue_publish("recovered")
+        else:
+            record_queue_publish("success")
+        return task_id
+
+    async def _mark_publish_failed(self, run_id: str, error_type: str) -> None:
+        failure = {
+            "status": "queue_unavailable",
+            "reason": "queue_publish_failed",
+            "error_type": error_type,
+            "side_effect_state": "not_started",
+        }
+        async with self.database.sessions.begin() as session:
+            await session.execute(
+                update(RunRow)
+                .where(
+                    RunRow.id == run_id,
+                    RunRow.status.in_(["queued", "retrying"]),
+                    RunRow.worker_id.is_(None),
+                )
+                .values(status="retrying", failure_context=failure)
+            )
+
+    async def _clear_publish_failure(self, run_id: str) -> None:
+        async with self.database.sessions.begin() as session:
+            await session.execute(
+                update(RunRow)
+                .where(
+                    RunRow.id == run_id,
+                    RunRow.status == "retrying",
+                    RunRow.worker_id.is_(None),
+                )
+                .values(status="queued", failure_context=None)
+            )
+
+    async def recover_publish_failures(self, *, limit: int = 100) -> list[str]:
+        async with self.database.sessions() as session:
+            run_ids = list(
+                (
+                    await session.scalars(
+                        select(RunRow.id)
+                        .where(
+                            RunRow.status == "retrying",
+                            RunRow.worker_id.is_(None),
+                            RunRow.cancel_requested.is_(False),
+                        )
+                        .order_by(RunRow.queued_at.asc())
+                        .limit(limit)
+                    )
+                ).all()
+            )
+
+        recovered: list[str] = []
+        for run_id in run_ids:
+            try:
+                await self._publish_run(run_id, recovered=True)
+            except QueuePublishError:
+                continue
+            recovered.append(run_id)
+        return recovered
 
     async def cancel(self, run_id: str) -> dict[str, Any]:
         row = await self.database.request_cancel(run_id)
@@ -299,17 +437,21 @@ class RunDispatcher:
         recovered = await self.database.recover_stale_runs(
             self.settings.run_stale_after_seconds
         )
+        for outcome, run_ids in recovered.items():
+            stale_recovery_recorded(outcome=outcome, count=len(run_ids))
         if self.settings.execution_backend == "redis":
             for run_id in recovered["requeued"]:
-                await execute_run_task.kicker().with_task_id(
-                    f"skillwright-run-retry-{run_id}-{uuid4()}"
-                ).kiq(run_id)
+                try:
+                    await self._publish_run(run_id, recovered=True)
+                except QueuePublishError:
+                    continue
         return recovered
 
     async def _reaper_loop(self) -> None:
         while True:
             await asyncio.sleep(self.settings.stale_reaper_interval_seconds)
             try:
+                await self.recover_publish_failures()
                 await self.recover_stale()
             except Exception:
                 # A transient Redis/DB outage must not kill the reaper loop.

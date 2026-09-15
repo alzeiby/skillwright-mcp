@@ -2,66 +2,56 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from typing import Any, Literal
 
 from mcp.server import MCPServer
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import Context, authenticated_principal
 
 from . import __version__
-from .auth import AuthorizationError, AuthorizationService, Role, SkillPermission
-from .browser import BrowserController
+from .auth import (
+    AuthorizationError,
+    BearerTokenAuthenticator,
+    MCPBearerTokenVerifier,
+    Role,
+    SkillPermission,
+)
 from .config import Settings
-from .db import Database, PrincipalRow, RunRow, SkillRow
-from .engine import WorkflowEngine
-from .playwright import PlaywrightMCPClient
-from .queue import RunDispatcher
-from .skills import SkillService
+from .db import PrincipalRow, RunRow, SkillRow
+from .runtime import Runtime, runtime_lifespan
+from .secrets import SecretResolutionError, validate_secret_ref
 from .workflow import ParameterBinding
 
-
-@dataclass(slots=True)
-class AppContext:
-    settings: Settings
-    database: Database
-    playwright: PlaywrightMCPClient
-    browser: BrowserController
-    engine: WorkflowEngine
-    skills: SkillService
-    dispatcher: RunDispatcher
-    authorization: AuthorizationService
+AppContext = Runtime
+_server_settings = Settings()
+_bearer_auth = BearerTokenAuthenticator(_server_settings.auth_token_hashes)
+_token_verifier = (
+    MCPBearerTokenVerifier(
+        _bearer_auth,
+        issuer=_server_settings.auth_issuer_url,
+        resource=_server_settings.mcp_resource_server_url,
+    )
+    if _bearer_auth.configured
+    else None
+)
+_auth_settings = (
+    AuthSettings.model_validate(
+        {
+            "issuer_url": _server_settings.auth_issuer_url,
+            "resource_server_url": _server_settings.mcp_resource_server_url,
+            "validate_token_resource": _server_settings.mcp_resource_server_url is not None,
+        }
+    )
+    if _token_verifier is not None
+    else None
+)
 
 
 @asynccontextmanager
 async def app_lifespan(_: MCPServer[AppContext]) -> AsyncIterator[AppContext]:
-    settings = Settings()
-    database = Database(settings.database_url)
-    await database.initialize(create_schema=settings.database_auto_create_schema)
-    authorization = AuthorizationService(database, settings)
-    if settings.allow_unauthenticated_local:
-        await authorization.local_principal()
-    playwright = PlaywrightMCPClient(settings)
-    browser = BrowserController(playwright, database)
-    engine = WorkflowEngine(database, browser, authorization)
-    skills = SkillService(database, browser, engine)
-    dispatcher = RunDispatcher(settings=settings, database=database, engine=engine)
-    await dispatcher.start()
-    context = AppContext(
-        settings=settings,
-        database=database,
-        playwright=playwright,
-        browser=browser,
-        engine=engine,
-        skills=skills,
-        dispatcher=dispatcher,
-        authorization=authorization,
-    )
-    try:
-        yield context
-    finally:
-        await dispatcher.close()
-        await playwright.close()
-        await database.close()
+    async with runtime_lifespan(_server_settings) as runtime:
+        yield runtime
 
 
 mcp = MCPServer(
@@ -74,6 +64,8 @@ mcp = MCPServer(
         "call skill_repair with the selected replacement element id."
     ),
     lifespan=app_lifespan,
+    auth=_auth_settings,
+    token_verifier=_token_verifier,
 )
 
 
@@ -83,6 +75,11 @@ def _app(ctx: Context[AppContext]) -> AppContext:
 
 async def _principal(ctx: Context[AppContext]) -> PrincipalRow:
     app = _app(ctx)
+    access_token = get_access_token()
+    if access_token is not None:
+        external_key = (access_token.claims or {}).get("skillwright_external_key")
+        if isinstance(external_key, str):
+            return await app.authorization.authenticated_principal(external_key)
     external_key = authenticated_principal(ctx.request_context)
     if external_key is not None:
         return await app.authorization.authenticated_principal(external_key)
@@ -195,6 +192,38 @@ async def browser_fill(
         await app.browser.fill(
             target,
             text,
+            element=element,
+            submit=submit,
+            actor_principal_id=principal.id,
+        )
+    ).as_dict()
+
+
+@mcp.tool()
+async def browser_fill_secret(
+    target: str,
+    secret_ref: str,
+    input_name: str,
+    ctx: Context[AppContext],
+    element: str | None = None,
+    submit: bool = False,
+) -> dict[str, Any]:
+    """Fill a field from a server-side secret without returning or persisting its value."""
+
+    app = _app(ctx)
+    principal = await _principal(ctx)
+    app.authorization.require_global(principal, "admin")
+    try:
+        normalized_ref = validate_secret_ref(secret_ref)
+        secret_value = app.engine.secret_resolver.resolve(normalized_ref)
+    except (ValueError, SecretResolutionError) as exc:
+        return {"ok": False, "error": str(exc)}
+    return (
+        await app.browser.fill_secret(
+            target,
+            secret_value,
+            secret_ref=normalized_ref,
+            input_name=input_name,
             element=element,
             submit=submit,
             actor_principal_id=principal.id,
@@ -371,6 +400,52 @@ async def skill_parameterize(
 
     await _skill(ctx, name, "edit")
     return await _app(ctx).skills.parameterize(name, bindings)
+
+
+@mcp.tool()
+async def skill_secret_bind(
+    name: str,
+    input_name: str,
+    secret_ref: str,
+    ctx: Context[AppContext],
+) -> dict[str, Any]:
+    """Bind a secret workflow input to a server-managed environment secret reference."""
+
+    app = _app(ctx)
+    principal, _ = await _skill(ctx, name, "manage")
+    app.authorization.require_global(principal, "admin")
+    return await app.skills.bind_secret(
+        name,
+        input_name=input_name,
+        secret_ref=secret_ref,
+        principal_id=principal.id,
+    )
+
+
+@mcp.tool()
+async def skill_secret_unbind(
+    name: str,
+    input_name: str,
+    ctx: Context[AppContext],
+) -> dict[str, Any]:
+    """Remove a server-side binding for a secret workflow input."""
+
+    app = _app(ctx)
+    principal, _ = await _skill(ctx, name, "manage")
+    app.authorization.require_global(principal, "admin")
+    return await app.skills.unbind_secret(
+        name,
+        input_name=input_name,
+        principal_id=principal.id,
+    )
+
+
+@mcp.tool()
+async def skill_secret_status(name: str, ctx: Context[AppContext]) -> dict[str, Any]:
+    """Show which secret inputs are configured without exposing references or values."""
+
+    await _skill(ctx, name, "manage")
+    return await _app(ctx).skills.secret_status(name)
 
 
 @mcp.tool()

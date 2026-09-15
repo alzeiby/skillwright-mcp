@@ -1,0 +1,166 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+
+from skillwright_mcp.browser import BrowserController
+from skillwright_mcp.config import Settings
+from skillwright_mcp.db import Database
+from skillwright_mcp.engine import WorkflowEngine
+from skillwright_mcp.queue import RunDispatcher, broker, execute_run_task
+from skillwright_mcp.workflow import WorkflowDefinition
+
+
+class NeverPlaywright:
+    async def call(self, *_args: object, **_kwargs: object) -> None:
+        raise AssertionError("queue publication must not execute browser work")
+
+    async def has_tool(self, _name: str) -> bool:
+        return False
+
+
+async def _dispatcher(tmp_path: Path) -> tuple[Database, RunDispatcher]:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'queue.db').as_posix()}")
+    await database.initialize(create_schema=True)
+    workflow = WorkflowDefinition.model_validate(
+        {
+            "name": "queue-smoke",
+            "steps": [{"op": "navigate", "url": "https://example.test"}],
+        }
+    )
+    await database.create_skill_version(workflow)
+    browser = BrowserController(cast(Any, NeverPlaywright()), database)
+    engine = WorkflowEngine(database, browser)
+    dispatcher = RunDispatcher(
+        settings=Settings(
+            database_url=database.url,
+            execution_backend="redis",
+        ),
+        database=database,
+        engine=engine,
+    )
+    return database, dispatcher
+
+
+@pytest.mark.asyncio
+async def test_publish_failure_is_recoverable_and_does_not_persist_broker_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, dispatcher = await _dispatcher(tmp_path)
+    sentinel = "redis://user:do-not-persist-me@example.test/0"
+
+    async def fail_publish(_dispatcher: RunDispatcher, _run_id: str) -> str:
+        raise ConnectionError(sentinel)
+
+    async def succeed_publish(_dispatcher: RunDispatcher, run_id: str) -> str:
+        return f"task-{run_id}"
+
+    try:
+        monkeypatch.setattr(RunDispatcher, "_send_task", fail_publish)
+        failed = await dispatcher.submit("queue-smoke")
+        assert failed["status"] == "queue_unavailable"
+        assert failed["queue_error_type"] == "ConnectionError"
+        assert sentinel not in str(failed)
+
+        run_id = str(failed["run_id"])
+        stored = await database.get_run(run_id)
+        assert stored is not None
+        assert stored.status == "retrying"
+        assert stored.failure_context == {
+            "status": "queue_unavailable",
+            "reason": "queue_publish_failed",
+            "error_type": "ConnectionError",
+            "side_effect_state": "not_started",
+        }
+        assert sentinel not in str(stored.failure_context)
+
+        monkeypatch.setattr(RunDispatcher, "_send_task", succeed_publish)
+        assert await dispatcher.recover_publish_failures() == [run_id]
+        recovered = await database.get_run(run_id)
+        assert recovered is not None
+        assert recovered.status == "queued"
+        assert recovered.failure_context is None
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_idempotent_retry_republishes_retrying_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, dispatcher = await _dispatcher(tmp_path)
+    attempts = 0
+
+    async def flaky_publish(_dispatcher: RunDispatcher, run_id: str) -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ConnectionError("down")
+        return f"task-{run_id}"
+
+    try:
+        monkeypatch.setattr(RunDispatcher, "_send_task", flaky_publish)
+        first = await dispatcher.submit("queue-smoke", idempotency_key="same-request")
+        assert first["status"] == "queue_unavailable"
+
+        second = await dispatcher.submit("queue-smoke", idempotency_key="same-request")
+        assert second["status"] == "queued"
+        assert second["run_id"] == first["run_id"]
+        assert attempts == 2
+
+        stored = await database.get_run(str(first["run_id"]))
+        assert stored is not None
+        assert stored.status == "queued"
+        assert stored.failure_context is None
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_publishes_with_broker_built_from_its_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'custom-broker.db').as_posix()}")
+    await database.initialize(create_schema=True)
+    browser = BrowserController(cast(Any, NeverPlaywright()), database)
+    engine = WorkflowEngine(database, browser)
+    settings = Settings(
+        database_url=database.url,
+        execution_backend="redis",
+        redis_url="redis://custom-redis.invalid:6388/7",
+        redis_queue_name="custom-skillwright-runs",
+    )
+    dispatcher = RunDispatcher(settings=settings, database=database, engine=engine)
+
+    try:
+        publisher_broker = dispatcher.publisher_broker
+        publish_task = dispatcher._publish_task
+        assert publisher_broker is not None
+        assert publish_task is not None
+        assert publisher_broker is not broker
+        assert publish_task.broker is publisher_broker
+        assert execute_run_task.broker is broker
+        assert publisher_broker.queue_name == "custom-skillwright-runs"
+        assert publisher_broker.connection_pool.connection_kwargs["host"] == "custom-redis.invalid"
+        assert publisher_broker.connection_pool.connection_kwargs["port"] == 6388
+        assert publisher_broker.connection_pool.connection_kwargs["db"] == 7
+
+        published: list[Any] = []
+
+        async def capture(message: Any) -> None:
+            published.append(message)
+
+        monkeypatch.setattr(publisher_broker, "kick", capture)
+        task_id = await dispatcher._send_task("custom-run")
+
+        assert task_id == "skillwright-run-custom-run"
+        assert published
+        assert published[0].task_name == "skillwright.execute_run"
+        assert b"custom-run" in published[0].message
+    finally:
+        await database.close()

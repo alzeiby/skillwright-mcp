@@ -12,6 +12,7 @@ from .workflow import (
     SelectStep,
     WaitStep,
     WorkflowDefinition,
+    WorkflowInput,
     WorkflowStep,
 )
 
@@ -27,6 +28,7 @@ def compile_actions(
     actions: Sequence[BrowserActionRow],
 ) -> WorkflowDefinition:
     steps: list[WorkflowStep] = []
+    inputs: dict[str, WorkflowInput] = {}
     for action in actions:
         if not action.success:
             continue
@@ -51,6 +53,26 @@ def compile_actions(
                     submit=bool(args.get("submit", False)),
                 )
             )
+        elif action.tool_name == "browser_fill_secret":
+            input_name = action.arguments.get("input_name")
+            if not isinstance(input_name, str) or not input_name:
+                raise WorkflowCompilationError(
+                    f"event {action.id} is missing a secret input name"
+                )
+            existing = inputs.get(input_name)
+            secret_input = WorkflowInput(type="string", required=True, secret=True)
+            if existing is not None and existing != secret_input:
+                raise WorkflowCompilationError(
+                    f"secret input {input_name!r} conflicts with an existing input definition"
+                )
+            inputs[input_name] = secret_input
+            steps.append(
+                FillStep(
+                    target=_compile_target(action),
+                    value="{{ " + input_name + " }}",
+                    submit=bool(args.get("submit", False)),
+                )
+            )
         elif action.tool_name == "browser_select":
             steps.append(
                 SelectStep(
@@ -69,7 +91,12 @@ def compile_actions(
 
     if not steps:
         raise WorkflowCompilationError("recording contains no successful workflow actions")
-    return WorkflowDefinition(name=name, description=description, steps=steps)
+    return WorkflowDefinition(
+        name=name,
+        description=description,
+        inputs=inputs,
+        steps=steps,
+    )
 
 
 def _compile_target(action: BrowserActionRow) -> ElementTarget:

@@ -7,6 +7,7 @@ from .browser import BrowserController
 from .compiler import WorkflowCompilationError, compile_actions
 from .db import Database
 from .engine import WorkflowEngine
+from .secrets import validate_secret_ref
 from .workflow import ApprovalGate, ParameterBinding, WorkflowDefinition, WorkflowInput
 
 
@@ -79,6 +80,11 @@ class SkillService:
             recording_id=recording_id,
             change_reason="recording",
         )
+        await self._bind_recorded_secrets(
+            skill_id=skill.id,
+            actions=actions,
+            principal_id=owner_principal_id,
+        )
         await self.database.stop_recording(recording_id, status="compiled")
         await self.database.audit(
             "skill.version.created",
@@ -120,6 +126,11 @@ class SkillService:
             workflow,
             owner_principal_id=owner_principal_id,
             change_reason=f"history events {start_event}-{end_event}",
+        )
+        await self._bind_recorded_secrets(
+            skill_id=skill.id,
+            actions=actions,
+            principal_id=owner_principal_id,
         )
         return {
             "status": "saved",
@@ -247,6 +258,7 @@ class SkillService:
             input_spec = WorkflowInput(
                 type=binding.input_type,
                 description=binding.description,
+                secret=binding.secret,
             ).model_dump(mode="json")
             if existing is not None and existing != input_spec:
                 return {
@@ -254,6 +266,9 @@ class SkillService:
                     "error": f"input {binding.input_name!r} is already defined differently",
                 }
             definition["inputs"][binding.input_name] = input_spec
+
+        if any(binding.secret for binding in bindings):
+            definition["schema_version"] = 3
 
         updated = WorkflowDefinition.model_validate(definition)
         try:
@@ -271,6 +286,104 @@ class SkillService:
             "version": new_version.version,
             "inputs": updated.model_dump(mode="json")["inputs"],
             "workflow": updated.model_dump(mode="json"),
+        }
+
+    async def bind_secret(
+        self,
+        name: str,
+        *,
+        input_name: str,
+        secret_ref: str,
+        principal_id: str | None,
+    ) -> dict[str, Any]:
+        stored = await self.database.get_workflow_version(name)
+        if stored is None:
+            return {"status": "not_found", "skill": name}
+        skill, version = stored
+        workflow = WorkflowDefinition.model_validate(version.definition)
+        input_spec = workflow.inputs.get(input_name)
+        if input_spec is None or not input_spec.secret:
+            return {
+                "status": "invalid_secret_input",
+                "skill": name,
+                "input": input_name,
+            }
+        try:
+            normalized_ref = validate_secret_ref(secret_ref)
+        except ValueError as exc:
+            return {"status": "invalid_secret_ref", "error": str(exc)}
+        await self.database.bind_skill_secret(
+            skill_id=skill.id,
+            input_name=input_name,
+            provider="env",
+            secret_ref=normalized_ref,
+            updated_by_principal_id=principal_id,
+        )
+        await self.database.audit(
+            "skill.secret.bound",
+            principal_id=principal_id,
+            entity_type="skill",
+            entity_id=skill.id,
+            data={"input": input_name, "provider": "env", "configured": True},
+        )
+        return {
+            "status": "bound",
+            "skill": name,
+            "input": input_name,
+            "provider": "env",
+            "configured": True,
+        }
+
+    async def unbind_secret(
+        self,
+        name: str,
+        *,
+        input_name: str,
+        principal_id: str | None,
+    ) -> dict[str, Any]:
+        skill = await self.database.get_skill(name)
+        if skill is None:
+            return {"status": "not_found", "skill": name}
+        removed = await self.database.unbind_skill_secret(
+            skill_id=skill.id,
+            input_name=input_name,
+        )
+        if removed:
+            await self.database.audit(
+                "skill.secret.unbound",
+                principal_id=principal_id,
+                entity_type="skill",
+                entity_id=skill.id,
+                data={"input": input_name, "configured": False},
+            )
+        return {
+            "status": "unbound" if removed else "not_bound",
+            "skill": name,
+            "input": input_name,
+            "configured": False,
+        }
+
+    async def secret_status(self, name: str) -> dict[str, Any]:
+        stored = await self.database.get_workflow_version(name)
+        if stored is None:
+            return {"status": "not_found", "skill": name}
+        skill, version = stored
+        workflow = WorkflowDefinition.model_validate(version.definition)
+        bindings = {
+            row.input_name: row for row in await self.database.skill_secret_bindings(skill.id)
+        }
+        return {
+            "status": "found",
+            "skill": name,
+            "secrets": [
+                {
+                    "input": input_name,
+                    "configured": input_name in bindings,
+                    "provider": bindings[input_name].provider if input_name in bindings else None,
+                }
+                for input_name, spec in workflow.inputs.items()
+                if spec.secret
+            ],
         }
 
     async def set_approval_gate(
@@ -298,7 +411,7 @@ class SkillService:
             return {"status": "invalid_approval", "error": "a required gate needs a reason"}
 
         definition = workflow.model_dump(mode="json")
-        definition["schema_version"] = 2
+        definition["schema_version"] = max(int(definition["schema_version"]), 2)
         definition["steps"][step]["approval"] = (
             ApprovalGate(reason=reason or "Approval required").model_dump(mode="json")
             if required
@@ -325,6 +438,36 @@ class SkillService:
             "step": step,
             "approval": definition["steps"][step]["approval"],
         }
+
+    async def _bind_recorded_secrets(
+        self,
+        *,
+        skill_id: str,
+        actions: Sequence[Any],
+        principal_id: str | None,
+    ) -> None:
+        seen: dict[str, str] = {}
+        for action in actions:
+            if action.tool_name != "browser_fill_secret":
+                continue
+            input_name = action.arguments.get("input_name")
+            secret_ref = action.arguments.get("secret_ref")
+            if not isinstance(input_name, str) or not isinstance(secret_ref, str):
+                continue
+            previous = seen.get(input_name)
+            if previous is not None and previous != secret_ref:
+                raise WorkflowCompilationError(
+                    f"recording uses multiple secret refs for input {input_name!r}"
+                )
+            seen[input_name] = secret_ref
+        for input_name, secret_ref in seen.items():
+            await self.database.bind_skill_secret(
+                skill_id=skill_id,
+                input_name=input_name,
+                provider="env",
+                secret_ref=validate_secret_ref(secret_ref),
+                updated_by_principal_id=principal_id,
+            )
 
 
 def _apply_parameter_binding(step: dict[str, Any], binding: ParameterBinding) -> str | None:

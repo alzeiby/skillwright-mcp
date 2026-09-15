@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any, cast
 
 import pytest
 from sqlalchemy import func, select
 
-from skillwright_mcp.auth import AuthorizationError, AuthorizationService
+from skillwright_mcp.auth import (
+    AuthorizationError,
+    AuthorizationService,
+    BearerTokenAuthenticator,
+    MCPBearerTokenVerifier,
+)
 from skillwright_mcp.browser import BrowserController
 from skillwright_mcp.config import Settings
 from skillwright_mcp.db import BrowserActionRow, Database
@@ -19,6 +25,30 @@ class NeverPlaywright:
 
     async def has_tool(self, _name: str) -> bool:
         return False
+
+
+@pytest.mark.asyncio
+async def test_hashed_bearer_authenticator_and_mcp_verifier_do_not_retain_token() -> None:
+    token = "opaque-test-service-token"
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    authenticator = BearerTokenAuthenticator({digest: "service@example.test"})
+    verifier = MCPBearerTokenVerifier(
+        authenticator,
+        issuer="https://auth.example.test",
+        resource="https://skillwright.example.test/mcp",
+    )
+
+    assert authenticator.principal_for_token(token) == "service@example.test"
+    assert authenticator.principal_for_token("wrong") is None
+    verified = await verifier.verify_token(token)
+    assert verified is not None
+    assert verified.token == "[REDACTED]"
+    assert verified.subject == "service@example.test"
+    assert verified.resource == "https://skillwright.example.test/mcp"
+    assert verified.claims == {
+        "iss": "https://auth.example.test",
+        "skillwright_external_key": "service@example.test",
+    }
 
 
 async def _setup(tmp_path: Any) -> tuple[Database, AuthorizationService]:
