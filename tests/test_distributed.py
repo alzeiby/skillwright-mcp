@@ -518,28 +518,39 @@ async def test_worker_aborts_long_step_when_run_ownership_is_lost(
     )
     skill, version = await database.create_skill_version(workflow)
     run = await database.create_run(skill=skill, version=version, inputs={}, status="queued")
-    fake = SlowWaitPlaywright()
+    fake = SlowWaitPlaywright(wait_seconds=0.5)
     engine = WorkflowEngine(database, BrowserController(cast(Any, fake), database))
     monkeypatch.setattr(engine_module, "RUN_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    original_heartbeat = database.heartbeat_run
+    ownership_injected = asyncio.Event()
+
+    async def heartbeat_with_ownership_loss(run_id: str, worker_id: str) -> bool:
+        current = asyncio.current_task()
+        if (
+            current is not None
+            and current.get_name().startswith("skillwright-run-heartbeat-")
+            and not ownership_injected.is_set()
+        ):
+            async with database.sessions.begin() as session:
+                updated_id = await session.scalar(
+                    update(RunRow)
+                    .where(
+                        RunRow.id == run_id,
+                        RunRow.status == "running",
+                        RunRow.worker_id == worker_id,
+                    )
+                    .values(worker_id="replacement-worker")
+                    .returning(RunRow.id)
+                )
+            assert updated_id == run_id
+            ownership_injected.set()
+        return await original_heartbeat(run_id, worker_id)
+
+    monkeypatch.setattr(database, "heartbeat_run", heartbeat_with_ownership_loss)
     task = asyncio.create_task(engine.execute_persisted_run(run.id, worker_id="worker-original"))
     try:
-        for _ in range(50):
-            stored = await database.get_run(run.id)
-            if stored is not None and stored.worker_id == "worker-original":
-                break
-            await asyncio.sleep(0.005)
-        else:
-            raise AssertionError("run was never claimed")
-
-        await asyncio.sleep(0.03)
-        async with database.sessions.begin() as session:
-            await session.execute(
-                update(RunRow)
-                .where(RunRow.id == run.id)
-                .values(worker_id="replacement-worker")
-            )
-
-        result = await asyncio.wait_for(task, timeout=0.5)
+        result = await asyncio.wait_for(task, timeout=1.0)
+        assert ownership_injected.is_set()
         assert result == {
             "status": "ignored",
             "run_id": run.id,
