@@ -50,6 +50,44 @@ class PersistOnlyDispatcher:
             "cancel_requested": row.cancel_requested,
         }
 
+    async def repair(
+        self,
+        run_id: str,
+        *,
+        step: int,
+        replacement_element_id: str,
+        persist: bool = True,
+    ) -> dict[str, Any]:
+        return await self.runtime.engine.request_repair(
+            run_id,
+            step=step,
+            replacement_element_id=replacement_element_id,
+            persist=persist,
+        )
+
+    async def decide_approval(
+        self,
+        approval_id: str,
+        *,
+        approve: bool,
+        decided_by_principal_id: str,
+        comment: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            approval = await self.runtime.database.decide_approval(
+                approval_id,
+                approve=approve,
+                decided_by_principal_id=decided_by_principal_id,
+                comment=comment,
+            )
+        except (KeyError, ValueError):
+            return {"status": "invalid_approval", "approval_id": approval_id}
+        return {
+            "status": "approved" if approve else "rejected",
+            "approval_id": approval.id,
+            "run_id": approval.run_id,
+        }
+
 
 def _runtime_factory(settings: Settings) -> Runtime:
     runtime = build_runtime(settings)
@@ -220,6 +258,140 @@ async def test_control_api_accepts_hashed_bearer_token_for_provisioned_principal
             )
             assert created.status_code == 202
             assert created.json()["status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_control_api_repair_and_approval_interventions_are_authorized_and_safe(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{(tmp_path / 'interventions.db').as_posix()}",
+        database_auto_create_schema=True,
+        execution_backend="inline",
+        allow_unauthenticated_local=True,
+        local_principal="intervention-admin@example.test",
+        local_role="admin",
+    )
+    app = create_app(settings, runtime_factory=_runtime_factory)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 50000))
+
+    async with app.router.lifespan_context(app):
+        runtime = cast(Runtime, app.state.runtime)
+        principal = await runtime.authorization.local_principal()
+        skill, version = await runtime.database.create_skill_version(
+            WorkflowDefinition.model_validate(
+                {
+                    "name": "intervention-skill",
+                    "steps": [
+                        {
+                            "op": "click",
+                            "target": {"role": "button", "name": "Original"},
+                        }
+                    ],
+                }
+            ),
+            owner_principal_id=principal.id,
+        )
+        repair_run = await runtime.database.create_run(
+            skill=skill,
+            version=version,
+            inputs={},
+            status="queued",
+            requested_by_principal_id=principal.id,
+        )
+        repair_context = {
+            "status": "repair_required",
+            "run_id": repair_run.id,
+            "step": 0,
+            "operation": "click",
+            "expected": {"role": "button", "name": "Original"},
+            "candidates": [
+                {
+                    "id": "candidate-0",
+                    "name": "Replacement",
+                    "target": {"role": "button", "name": "Replacement"},
+                }
+            ],
+            "session_available": True,
+        }
+        await runtime.database.update_run(
+            repair_run.id,
+            status="repair_required",
+            failure_context=repair_context,
+        )
+
+        approval_run = await runtime.database.create_run(
+            skill=skill,
+            version=version,
+            inputs={},
+            status="queued",
+            requested_by_principal_id=principal.id,
+        )
+        approval = await runtime.database.get_or_create_approval(
+            run_id=approval_run.id,
+            workflow_version_id=version.id,
+            step_index=0,
+            gate_fingerprint="a" * 64,
+            reason="External side effect",
+            requested_by_principal_id=principal.id,
+        )
+        await runtime.database.update_run(
+            approval_run.id,
+            status="approval_required",
+            failure_context={
+                "status": "approval_required",
+                "run_id": approval_run.id,
+                "step": 0,
+                "operation": "click",
+                "approval_id": approval.id,
+                "reason": approval.reason,
+                "target": {"role": "button", "name": "Original"},
+                "session_available": True,
+            },
+        )
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+            repair_view = await client.get(
+                f"/api/v1/runs/{repair_run.id}/intervention"
+            )
+            assert repair_view.status_code == 200
+            assert repair_view.json()["type"] == "repair"
+            assert repair_view.json()["candidates"][0]["id"] == "candidate-0"
+
+            repair = await client.post(
+                f"/api/v1/runs/{repair_run.id}/repair",
+                json={
+                    "step": 0,
+                    "replacement_element_id": "candidate-0",
+                    "persist": True,
+                },
+            )
+            assert repair.status_code == 200
+            assert repair.json()["status"] == "repair_pending"
+            assert "candidates" not in repair.text
+
+            approval_view = await client.get(
+                f"/api/v1/runs/{approval_run.id}/intervention"
+            )
+            assert approval_view.status_code == 200
+            assert approval_view.json()["type"] == "approval"
+            assert approval_view.json()["approval_id"] == approval.id
+
+            rejected = await client.post(
+                f"/api/v1/approvals/{approval.id}/decision",
+                json={"approve": False, "comment": "Reviewed and rejected"},
+            )
+            assert rejected.status_code == 200
+            assert rejected.json() == {
+                "status": "rejected",
+                "approval_id": approval.id,
+                "run_id": approval_run.id,
+            }
+
+            stored_approval = await runtime.database.get_approval(approval.id)
+            assert stored_approval is not None
+            assert stored_approval.status == "rejected"
+            assert stored_approval.comment == "Reviewed and rejected"
 
 
 def test_playwright_defaults_disable_automatic_action_snapshots() -> None:

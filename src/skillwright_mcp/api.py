@@ -57,6 +57,21 @@ class RunStatus(BaseModel):
     finished_at: datetime | None
 
 
+class RepairRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    step: int = Field(ge=0)
+    replacement_element_id: str = Field(min_length=1, max_length=80)
+    persist: bool = True
+
+
+class ApprovalDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    approve: bool
+    comment: str | None = Field(default=None, max_length=2_000)
+
+
 def _runtime(request: Request) -> Runtime:
     return cast(Runtime, request.app.state.runtime)
 
@@ -130,6 +145,34 @@ async def _authorized_run(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"})
     await runtime.authorization.require_skill(principal, skill, permission)
     return run
+
+
+def _intervention_context(run: RunRow) -> dict[str, Any] | None:
+    context = run.failure_context or {}
+    if run.status == "repair_required":
+        return {
+            "type": "repair",
+            "run_id": run.id,
+            "status": run.status,
+            "step": context.get("step"),
+            "operation": context.get("operation"),
+            "expected": context.get("expected"),
+            "candidates": context.get("candidates", []),
+            "session_available": context.get("session_available", False),
+        }
+    if run.status == "approval_required":
+        return {
+            "type": "approval",
+            "run_id": run.id,
+            "status": run.status,
+            "step": context.get("step"),
+            "operation": context.get("operation"),
+            "approval_id": context.get("approval_id"),
+            "reason": context.get("reason"),
+            "target": context.get("target"),
+            "session_available": context.get("session_available", False),
+        }
+    return None
 
 
 def create_app(
@@ -273,6 +316,115 @@ def create_app(
             else status.HTTP_200_OK
         )
         return _run_status(run)
+
+    @api.get("/api/v1/runs/{run_id}/intervention")
+    async def get_intervention(run_id: str, request: Request) -> dict[str, Any]:
+        runtime = _runtime(request)
+        principal = await resolve_principal(request, runtime)
+        run = await runtime.database.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"})
+        skill = await runtime.database.get_skill_by_id(run.skill_id)
+        if skill is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"})
+        if run.status == "repair_required":
+            permission: SkillPermission = "edit"
+        elif run.status == "approval_required":
+            permission = "approve"
+        else:
+            permission = "view"
+        await runtime.authorization.require_skill(principal, skill, permission)
+        context = _intervention_context(run)
+        if context is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "no_intervention_required", "status": run.status},
+            )
+        return context
+
+    @api.post("/api/v1/runs/{run_id}/repair")
+    async def repair_run(
+        run_id: str,
+        payload: RepairRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        runtime = _runtime(request)
+        principal = await resolve_principal(request, runtime)
+        await _authorized_run(runtime, principal, run_id, "edit")
+        result = await runtime.dispatcher.repair(
+            run_id,
+            step=payload.step,
+            replacement_element_id=payload.replacement_element_id,
+            persist=payload.persist,
+        )
+        result_status = str(result.get("status"))
+        if result_status == "not_found":
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"})
+        if result_status in {"not_repairable", "repair_conflict", "repair_session_mismatch"}:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": result_status},
+            )
+        if result_status in {"invalid_repair", "repair_validation_failed"}:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": result_status},
+            )
+        return {
+            key: value
+            for key, value in result.items()
+            if key
+            in {
+                "status",
+                "run_id",
+                "repair_id",
+                "step",
+                "replacement_element_id",
+                "saved_workflow_version",
+            }
+        }
+
+    @api.post("/api/v1/approvals/{approval_id}/decision")
+    async def decide_approval(
+        approval_id: str,
+        payload: ApprovalDecision,
+        request: Request,
+    ) -> dict[str, Any]:
+        runtime = _runtime(request)
+        principal = await resolve_principal(request, runtime)
+        approval = await runtime.database.get_approval(approval_id)
+        if approval is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"})
+        run = await runtime.database.get_run(approval.run_id)
+        if run is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"})
+        skill = await runtime.database.get_skill_by_id(run.skill_id)
+        if skill is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"})
+        await runtime.authorization.require_skill(principal, skill, "approve")
+        result = await runtime.dispatcher.decide_approval(
+            approval_id,
+            approve=payload.approve,
+            decided_by_principal_id=principal.id,
+            comment=payload.comment,
+        )
+        if result.get("status") == "invalid_approval":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "invalid_approval"},
+            )
+        await runtime.database.audit(
+            "approval.decided",
+            principal_id=principal.id,
+            entity_type="approval",
+            entity_id=approval.id,
+            data={"approve": payload.approve, "run_id": approval.run_id},
+        )
+        return {
+            key: value
+            for key, value in result.items()
+            if key in {"status", "approval_id", "run_id"}
+        }
 
     instrument_fastapi(api, observability)
     return api
