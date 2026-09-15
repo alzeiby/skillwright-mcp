@@ -356,6 +356,7 @@ def create_app(
             step=payload.step,
             replacement_element_id=payload.replacement_element_id,
             persist=payload.persist,
+            actor_principal_id=principal.id,
         )
         result_status = str(result.get("status"))
         if result_status == "not_found":
