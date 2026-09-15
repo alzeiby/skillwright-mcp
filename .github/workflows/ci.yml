@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.21"
+          enable-cache: true
+      - run: uv sync --frozen --all-extras
+      - run: uv run ruff check src tests alembic
+      - run: uv run mypy src/skillwright_mcp
+
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.21"
+          enable-cache: true
+      - run: uv sync --frozen --all-extras
+      - run: >-
+          uv run pytest -q
+          --ignore=tests/test_integration_browser.py
+          --ignore=tests/test_services_integration.py
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: skillwright
+          POSTGRES_USER: skillwright
+          POSTGRES_PASSWORD: skillwright
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U skillwright -d skillwright"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      SKILLWRIGHT_DATABASE_URL: postgresql+asyncpg://skillwright:skillwright@127.0.0.1:5432/skillwright
+      SKILLWRIGHT_REDIS_URL: redis://127.0.0.1:6379/0
+      SKILLWRIGHT_INTEGRATION_SERVICES: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.21"
+          enable-cache: true
+      - run: uv sync --frozen --all-extras
+      - name: Install pinned Playwright MCP and Chromium
+        run: |
+          npm install --global --omit=dev @playwright/mcp@0.0.81
+          npm_root="$(npm root --global)"
+          playwright_cli="$npm_root/@playwright/mcp/node_modules/playwright/cli.js"
+          test -f "$playwright_cli"
+          node "$playwright_cli" install --with-deps chromium
+          browser_path="$(find "$HOME/.cache/ms-playwright" -path '*/chrome-linux64/chrome' -type f -print -quit)"
+          test -x "$browser_path"
+          mcp_binary="$(command -v playwright-mcp)"
+          test -x "$mcp_binary"
+          echo "SKILLWRIGHT_PLAYWRIGHT_EXECUTABLE=$browser_path" >> "$GITHUB_ENV"
+          echo "SKILLWRIGHT_PLAYWRIGHT_MCP_BINARY=$mcp_binary" >> "$GITHUB_ENV"
+          chmod +x scripts/playwright-mcp-offline.sh
+      - name: Validate migrations forward and backward
+        run: |
+          uv run alembic upgrade head
+          uv run alembic downgrade a6f585d77dc1
+          uv run alembic upgrade head
+          uv run alembic check
+      - run: uv run pytest -q tests/test_services_integration.py
+      - name: Run real browser integration
+        env:
+          SKILLWRIGHT_PLAYWRIGHT_COMMAND: ${{ github.workspace }}/scripts/playwright-mcp-offline.sh
+          SKILLWRIGHT_PLAYWRIGHT_PACKAGE: "@playwright/mcp@0.0.81"
+        run: uv run pytest -q tests/test_integration_browser.py
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose configuration
+        run: docker compose --profile app config --quiet
+      - run: docker build --tag skillwright-mcp:ci --tag skillwright-mcp:local .
+      - name: Verify non-root runtime and preinstalled browser
+        run: |
+          docker run --rm --entrypoint /bin/sh skillwright-mcp:ci -c '
+            test "$(id -u)" = "10001"
+            test ! -x /usr/local/bin/npm
+            test ! -x /usr/local/bin/npx
+            command -v playwright-mcp >/dev/null
+            test -x /usr/local/bin/skillwright-chromium
+            find /ms-playwright -maxdepth 1 -type d -name "chromium*" | grep -q .
+          '
+      - name: Verify offline Playwright MCP wrapper
+        run: >-
+          docker run --rm
+          --entrypoint /usr/local/bin/skillwright-playwright-mcp
+          skillwright-mcp:ci
+          --yes @playwright/mcp@0.0.81 --help
+      - name: Launch bundled Chromium through MCP
+        run: |
+          docker run --rm -i --entrypoint /opt/skillwright/bin/python skillwright-mcp:ci - <<'PY'
+          import asyncio
+
+          from skillwright_mcp.config import Settings
+          from skillwright_mcp.playwright import PlaywrightMCPClient
+
+
+          async def main() -> None:
+              client = PlaywrightMCPClient(Settings())
+              try:
+                  result = await client.call("browser_navigate", {"url": "about:blank"})
+                  assert result.ok, result.text
+              finally:
+                  await client.close()
+
+
+          asyncio.run(main())
+          PY
+      - name: Smoke production Compose topology
+        run: |
+          smoke_token="$(openssl rand -hex 32)"
+          smoke_hash="$(printf '%s' "$smoke_token" | sha256sum | awk '{print $1}')"
+          export SKILLWRIGHT_BOOTSTRAP_ADMIN_PRINCIPAL=compose-smoke-admin
+          export SKILLWRIGHT_AUTH_TOKEN_HASHES="{\"$smoke_hash\":\"compose-smoke-admin\"}"
+          export SKILLWRIGHT_SMOKE_BEARER_TOKEN="$smoke_token"
+          docker compose --profile app up -d --no-build --wait --wait-timeout 120
+          sh scripts/compose-smoke.sh
+          docker compose --profile app ps
+      - if: failure()
+        run: docker compose --profile app logs --no-color api mcp worker migrate otel-collector
+      - if: always()
+        run: docker compose --profile app down --volumes --remove-orphans
