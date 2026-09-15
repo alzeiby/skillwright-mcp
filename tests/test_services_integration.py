@@ -11,7 +11,6 @@ from alembic.script import ScriptDirectory
 from redis.asyncio import Redis
 from sqlalchemy import func, select, text
 
-from skillwright_mcp.auth import AuthorizationService
 from skillwright_mcp.config import Settings
 from skillwright_mcp.db import SCHEMA_REVISION, AuditEventRow, BrowserActionRow, Database
 from skillwright_mcp.engine import WorkflowEngine
@@ -43,11 +42,11 @@ async def test_postgres_is_migrated_to_alembic_head_and_usable() -> None:
             current_head = await session.scalar(text("SELECT version_num FROM alembic_version"))
         assert current_head == expected_head
 
-        principal = await database.ensure_principal("ci:service-integration", role="viewer")
+        principal = await database.ensure_principal("ci:service-integration")
         loaded = await database.get_principal_by_external_key("ci:service-integration")
         assert loaded is not None
         assert loaded.id == principal.id
-        assert loaded.role == "viewer"
+        assert loaded.external_key == "ci:service-integration"
     finally:
         await database.close()
 
@@ -90,14 +89,10 @@ async def test_taskiq_worker_executes_concurrent_published_runs_to_postgres() ->
 
     database = Database(settings.database_url)
     await database.initialize(create_schema=False)
-    authorization = AuthorizationService(database, settings)
     dispatcher: RunDispatcher | None = None
     try:
-        principal = await database.ensure_principal(
-            f"ci:worker:{uuid4().hex}",
-            role="developer",
-        )
-        engine = WorkflowEngine(database, cast(Any, None), authorization)
+        principal = await database.ensure_principal(f"ci:worker:{uuid4().hex}")
+        engine = WorkflowEngine(database, cast(Any, None))
         dispatcher = RunDispatcher(
             settings=settings,
             database=database,
@@ -184,7 +179,9 @@ async def test_taskiq_worker_executes_concurrent_published_runs_to_postgres() ->
         async with database.sessions() as session:
             for run_id in run_ids:
                 action_count = await session.scalar(
-                    select(func.count()).select_from(BrowserActionRow).where(
+                    select(func.count())
+                    .select_from(BrowserActionRow)
+                    .where(
                         BrowserActionRow.run_id == run_id,
                         BrowserActionRow.source == "replay",
                     )

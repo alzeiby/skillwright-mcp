@@ -9,7 +9,6 @@ from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
-from .auth import AuthorizationError, AuthorizationService
 from .browser import BrowserActionResult, BrowserController
 from .db import Database, RepairRow, RunRow, SkillRow, WorkflowVersionRow
 from .secrets import (
@@ -49,12 +48,10 @@ class WorkflowEngine:
         self,
         database: Database,
         browser: BrowserController,
-        authorization: AuthorizationService | None = None,
         secret_resolver: SecretResolver | None = None,
     ) -> None:
         self.database = database
         self.browser = browser
-        self.authorization = authorization
         self.secret_resolver = secret_resolver or SecretResolver()
 
     async def run_skill(
@@ -202,41 +199,6 @@ class WorkflowEngine:
                 }
             return {"status": "failed", "run_id": claimed.id, "error": "workflow version missing"}
 
-        if claimed.requested_by_principal_id is not None and self.authorization is not None:
-            try:
-                principal = await self.authorization.principal_by_id(
-                    claimed.requested_by_principal_id
-                )
-                await self.authorization.require_skill(principal, skill, "run")
-            except AuthorizationError as exc:
-                failure = {
-                    "status": "failed",
-                    "run_id": claimed.id,
-                    "reason": "permission_revoked_before_execution",
-                    "error": str(exc),
-                    "side_effect_state": "not_started",
-                }
-                updated = await self.database.update_owned_run(
-                    claimed.id,
-                    worker_id,
-                    status="failed",
-                    failure_context=failure,
-                    finish=True,
-                )
-                if not updated:
-                    return {
-                        "status": "ignored",
-                        "run_id": claimed.id,
-                        "reason": "run_ownership_lost",
-                    }
-                await self.database.audit(
-                    "skill.run.permission_denied",
-                    principal_id=claimed.requested_by_principal_id,
-                    entity_type="run",
-                    entity_id=claimed.id,
-                    data={"skill": skill.name, "reason": str(exc)},
-                )
-                return failure
 
         definition = deepcopy(version_row.definition)
         for step_key, target in claimed.repair_overrides.items():
@@ -688,40 +650,6 @@ class WorkflowEngine:
         skill = await self.database.get_skill_by_id(run.skill_id)
         if version_row is None or skill is None:
             return {"status": "failed", "run_id": run.id, "error": "workflow version missing"}
-        if run.requested_by_principal_id is not None and self.authorization is not None:
-            try:
-                principal = await self.authorization.principal_by_id(run.requested_by_principal_id)
-                await self.authorization.require_skill(principal, skill, "run")
-            except AuthorizationError as exc:
-                failure = {
-                    "status": "failed",
-                    "run_id": run.id,
-                    "reason": "permission_revoked_before_approved_action",
-                    "error": str(exc),
-                    "side_effect_state": "not_started",
-                }
-                if worker_id is None:
-                    await self.database.update_run(
-                        run.id,
-                        status="failed",
-                        failure_context=failure,
-                        finish=True,
-                    )
-                elif not await self.database.update_owned_run(
-                    run.id,
-                    worker_id,
-                    expected_status="approval_required",
-                    require_not_cancelled=True,
-                    status="failed",
-                    failure_context=failure,
-                    finish=True,
-                ):
-                    latest = await self.database.get_run(run.id)
-                    return {
-                        "status": latest.status if latest is not None else "not_found",
-                        "run_id": run.id,
-                    }
-                return failure
 
         definition = deepcopy(version_row.definition)
         for step_key, target in run.repair_overrides.items():

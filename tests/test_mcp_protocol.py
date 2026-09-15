@@ -112,9 +112,7 @@ async def test_streamable_http_readiness_requires_all_reported_dependencies(
         response = await client.get("/health/ready")
 
     assert response.status_code == expected_status
-    assert response.json() == {
-        "status": "ready" if expected_status == 200 else "not_ready"
-    }
+    assert response.json() == {"status": "ready" if expected_status == 200 else "not_ready"}
     assert runtime.calls == 1
     assert runtime.start_calls == (1 if expected_status == 200 else 0)
 
@@ -189,7 +187,6 @@ async def test_streamable_http_readiness_survives_dependency_startup_failure_wit
         database_auto_create_schema=True,
         execution_backend="inline",
         allow_unauthenticated_local=False,
-        bootstrap_admin_principal="bootstrap@example.test",
         healthcheck_timeout_seconds=1.0,
     )
     monkeypatch.setattr(server_module, "_server_settings", settings)
@@ -223,16 +220,10 @@ async def test_streamable_http_readiness_survives_dependency_startup_failure_wit
     ):
         ready = await client.get("/health/ready")
         ready_again = await client.get("/health/ready")
-        runtime = server_module._http_runtime
-        assert runtime is not None
-        bootstrap_admin = await runtime.database.get_principal_by_external_key(
-            "bootstrap@example.test"
-        )
+        assert server_module._http_runtime is not None
 
     assert initialize_calls == 2
     assert ready.status_code == 200
     assert ready.json() == {"status": "ready"}
     assert ready_again.status_code == 200
     assert ready_again.json() == {"status": "ready"}
-    assert bootstrap_admin is not None
-    assert bootstrap_admin.role == "admin"

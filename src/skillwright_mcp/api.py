@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import __version__
-from .auth import AuthorizationError, SkillPermission
+from .auth import AuthenticationError
 from .config import Settings
 from .db import PrincipalRow, RunRow, SkillRow
 from .observability import configure_observability, instrument_fastapi
@@ -93,13 +93,13 @@ async def _default_principal_resolver(request: Request, runtime: Runtime) -> Pri
         if separator and scheme.casefold() == "bearer" and token:
             external_key = runtime.bearer_auth.principal_for_token(token)
             if external_key is not None:
-                return await runtime.authorization.authenticated_principal(external_key)
+                return await runtime.identity.authenticated_principal(external_key)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "invalid_token"},
         )
     if runtime.settings.allow_unauthenticated_local and _is_loopback(request):
-        return await runtime.authorization.local_principal()
+        return await runtime.identity.local_principal()
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail={"code": "authentication_required"},
@@ -119,32 +119,20 @@ def _run_status(row: RunRow) -> RunStatus:
     )
 
 
-async def _authorized_skill(
-    runtime: Runtime,
-    principal: PrincipalRow,
-    name: str,
-    permission: SkillPermission,
-) -> SkillRow:
+async def _skill(runtime: Runtime, name: str) -> SkillRow:
     skill = await runtime.database.get_skill(name)
     if skill is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"})
-    await runtime.authorization.require_skill(principal, skill, permission)
     return skill
 
 
-async def _authorized_run(
-    runtime: Runtime,
-    principal: PrincipalRow,
-    run_id: str,
-    permission: SkillPermission,
-) -> RunRow:
+async def _run(runtime: Runtime, run_id: str) -> RunRow:
     run = await runtime.database.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"})
     skill = await runtime.database.get_skill_by_id(run.skill_id)
     if skill is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"})
-    await runtime.authorization.require_skill(principal, skill, permission)
     return run
 
 
@@ -209,14 +197,12 @@ def create_app(
         lifespan=lifespan,
     )
 
-    @api.exception_handler(AuthorizationError)
-    async def authorization_error(_: Request, exc: AuthorizationError) -> JSONResponse:
-        status_code = (
-            status.HTTP_401_UNAUTHORIZED
-            if exc.code in {"authentication_required", "unknown_principal"}
-            else status.HTTP_403_FORBIDDEN
+    @api.exception_handler(AuthenticationError)
+    async def authentication_error(_: Request, exc: AuthenticationError) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"detail": {"code": exc.code}},
         )
-        return JSONResponse(status_code=status_code, content={"detail": {"code": exc.code}})
 
     @api.get("/health/live")
     async def health_live() -> dict[str, str]:
@@ -235,7 +221,7 @@ def create_app(
     async def create_run(payload: RunCreate, request: Request, response: Response) -> RunStatus:
         runtime = _runtime(request)
         principal = await resolve_principal(request, runtime)
-        await _authorized_skill(runtime, principal, payload.skill, "run")
+        await _skill(runtime, payload.skill)
         result = await runtime.dispatcher.submit(
             payload.skill,
             inputs=payload.inputs,
@@ -294,15 +280,15 @@ def create_app(
     @api.get("/api/v1/runs/{run_id}", response_model=RunStatus)
     async def get_run(run_id: str, request: Request) -> RunStatus:
         runtime = _runtime(request)
-        principal = await resolve_principal(request, runtime)
-        run = await _authorized_run(runtime, principal, run_id, "view")
+        await resolve_principal(request, runtime)
+        run = await _run(runtime, run_id)
         return _run_status(run)
 
     @api.post("/api/v1/runs/{run_id}/cancel", response_model=RunStatus)
     async def cancel_run(run_id: str, request: Request, response: Response) -> RunStatus:
         runtime = _runtime(request)
         principal = await resolve_principal(request, runtime)
-        before = await _authorized_run(runtime, principal, run_id, "run")
+        before = await _run(runtime, run_id)
         result = await runtime.dispatcher.cancel(
             run_id,
             actor_principal_id=principal.id,
@@ -329,20 +315,13 @@ def create_app(
     @api.get("/api/v1/runs/{run_id}/intervention")
     async def get_intervention(run_id: str, request: Request) -> dict[str, Any]:
         runtime = _runtime(request)
-        principal = await resolve_principal(request, runtime)
+        await resolve_principal(request, runtime)
         run = await runtime.database.get_run(run_id)
         if run is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"})
         skill = await runtime.database.get_skill_by_id(run.skill_id)
         if skill is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"})
-        if run.status == "repair_required":
-            permission: SkillPermission = "edit"
-        elif run.status == "approval_required":
-            permission = "approve"
-        else:
-            permission = "view"
-        await runtime.authorization.require_skill(principal, skill, permission)
         context = _intervention_context(run)
         if context is None:
             raise HTTPException(
@@ -359,7 +338,7 @@ def create_app(
     ) -> dict[str, Any]:
         runtime = _runtime(request)
         principal = await resolve_principal(request, runtime)
-        await _authorized_run(runtime, principal, run_id, "edit")
+        await _run(runtime, run_id)
         result = await runtime.dispatcher.repair(
             run_id,
             step=payload.step,
@@ -411,7 +390,6 @@ def create_app(
         skill = await runtime.database.get_skill_by_id(run.skill_id)
         if skill is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"})
-        await runtime.authorization.require_skill(principal, skill, "approve")
         result = await runtime.dispatcher.decide_approval(
             approval_id,
             approve=payload.approve,

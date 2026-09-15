@@ -5,10 +5,6 @@ FROM ghcr.io/astral-sh/uv:0.11.21 AS uv
 
 FROM python:3.12-slim-bookworm AS runtime
 
-ADD --checksum=sha256:e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3 \
-    https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
-    /etc/ssl/certs/aws-rds-global-bundle.pem
-
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
@@ -53,7 +49,6 @@ COPY scripts/container-entrypoint.sh /usr/local/bin/skillwright-container-entryp
 COPY scripts/playwright-mcp-offline.sh /usr/local/bin/skillwright-playwright-mcp
 
 RUN chmod 0755 /usr/local/bin/skillwright-container-entrypoint /usr/local/bin/skillwright-playwright-mcp \
-    && chmod 0644 /etc/ssl/certs/aws-rds-global-bundle.pem \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin skillwright \
     && mkdir -p /var/lib/skillwright/playwright-output \
     && chown -R skillwright:skillwright /var/lib/skillwright /home/skillwright \

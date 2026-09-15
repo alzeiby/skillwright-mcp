@@ -13,7 +13,6 @@ from sqlalchemy import select, update
 from taskiq import AsyncTaskiqDecoratedTask
 from taskiq_redis import RedisStreamBroker
 
-from .auth import AuthorizationService
 from .browser import BrowserController
 from .config import Settings
 from .db import Database, RunRow
@@ -70,17 +69,12 @@ async def execute_run(run_id: str) -> dict[str, Any]:
         connect_args=settings.resolved_database_connect_args(),
     )
     await database.initialize(create_schema=False)
-    authorization = AuthorizationService(database, settings)
     playwright = PlaywrightMCPClient(browser_settings)
     browser = BrowserController(playwright, database)
     engine = WorkflowEngine(
         database,
         browser,
-        authorization,
-        SecretResolver(
-            aws_region=settings.aws_region,
-            aws_timeout_seconds=settings.aws_secret_resolution_timeout_seconds,
-        ),
+        secret_resolver=SecretResolver(),
     )
     worker_id = _worker_id()
     try:

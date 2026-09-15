@@ -1,4 +1,4 @@
-"""expand secret references for managed providers
+"""expand secret reference capacity
 
 Revision ID: b71e2a4c9d30
 Revises: f24c9d0a8e11
@@ -20,7 +20,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    """Allow full AWS Secrets Manager and SSM names/ARNs."""
+    """Allow longer externally managed secret references."""
 
     op.alter_column(
         "skill_secret_bindings",

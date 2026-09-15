@@ -27,20 +27,12 @@ class Settings(BaseSettings):
     database_password: SecretStr | None = None
     database_ssl: Literal["disable", "prefer", "require", "verify-full"] | None = None
     database_ssl_root_cert: Path | None = None
-    migration_runtime_database_user: str | None = None
-    migration_runtime_database_secret_arn: str | None = None
-    migration_marker_parameter: str | None = None
-    release_image_tag: str | None = None
     database_auto_create_schema: bool = False
     allow_unauthenticated_local: bool = True
     local_principal: str = "local"
-    local_role: Literal["admin", "developer", "viewer"] = "admin"
-    bootstrap_admin_principal: str | None = None
     auth_token_hashes: dict[str, str] = Field(default_factory=dict)
     auth_issuer_url: str = "https://skillwright.local"
     mcp_resource_server_url: str | None = None
-    aws_region: str | None = None
-    aws_secret_resolution_timeout_seconds: float = Field(default=15.0, gt=0, le=20)
     execution_backend: Literal["inline", "redis"] = "redis"
     redis_url: str = "redis://127.0.0.1:63799/0"
     redis_queue_name: str = "skillwright-runs"

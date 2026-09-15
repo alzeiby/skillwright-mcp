@@ -62,7 +62,7 @@ class PausedClickPlaywright:
         _arguments: dict[str, Any] | None = None,
     ) -> BrowserResult:
         if tool_name == "browser_snapshot":
-            text = '\n'.join(
+            text = "\n".join(
                 [
                     "- Page URL: https://example.test/",
                     "- Page Title: Fixture",
@@ -145,8 +145,8 @@ async def test_run_idempotency_claim_and_queued_cancel(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_idempotency_reuse_requires_same_requester_version_and_inputs(tmp_path: Path) -> None:
     database, skill, version = await _database_with_skill(tmp_path)
-    first_requester = await database.ensure_principal("first@example.test", "developer")
-    second_requester = await database.ensure_principal("second@example.test", "developer")
+    first_requester = await database.ensure_principal("first@example.test")
+    second_requester = await database.ensure_principal("second@example.test")
     try:
         first = await database.create_run(
             skill=skill,
@@ -205,8 +205,8 @@ async def test_idempotency_reuse_requires_same_requester_version_and_inputs(tmp_
 @pytest.mark.asyncio
 async def test_idempotency_conflict_never_returns_other_requesters_run_data(tmp_path: Path) -> None:
     database, skill, _version = await _database_with_skill(tmp_path)
-    owner = await database.ensure_principal("owner@example.test", "developer")
-    runner = await database.ensure_principal("runner@example.test", "developer")
+    owner = await database.ensure_principal("owner@example.test")
+    runner = await database.ensure_principal("runner@example.test")
     engine = WorkflowEngine(database, cast(Any, object()))
     try:
         first = await engine.prepare_run(

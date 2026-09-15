@@ -89,7 +89,6 @@ SKILLWRIGHT_DATABASE_AUTO_CREATE_SCHEMA=true
 SKILLWRIGHT_EXECUTION_BACKEND=inline
 SKILLWRIGHT_ALLOW_UNAUTHENTICATED_LOCAL=true
 SKILLWRIGHT_LOCAL_PRINCIPAL=local
-SKILLWRIGHT_LOCAL_ROLE=admin
 ```
 
 `SKILLWRIGHT_DATABASE_AUTO_CREATE_SCHEMA=true` is intended for local development. Production uses
@@ -163,34 +162,31 @@ Stateful Streamable HTTP sessions receive separate interactive browser sessions;
 stateless/fallback traffic is isolated by authenticated principal. Idle interactive browser
 sessions are closed after 30 minutes.
 
-## Authentication and principal provisioning
+## Authentication and principals
 
 Skillwright uses opaque bearer service tokens. `SKILLWRIGHT_AUTH_TOKEN_HASHES` is a JSON object
-whose keys are SHA-256 token digests and whose values are Skillwright principal external keys. The
-raw bearer token is never stored in this setting.
+whose keys are SHA-256 token digests and whose values are principal external keys. The raw bearer
+token is never stored in this setting.
 
 The following command generates a high-entropy token and the corresponding JSON mapping for a
-principal named `ops-admin`:
+principal named `automation-service`:
 
 ```sh
-python -c "import hashlib,json,secrets; p='ops-admin'; t=secrets.token_urlsafe(48); print('TOKEN='+t); print('SKILLWRIGHT_AUTH_TOKEN_HASHES='+json.dumps({hashlib.sha256(t.encode()).hexdigest():p}))"
+python -c "import hashlib,json,secrets; p='automation-service'; t=secrets.token_urlsafe(48); print('TOKEN='+t); print('SKILLWRIGHT_AUTH_TOKEN_HASHES='+json.dumps({hashlib.sha256(t.encode()).hexdigest():p}))"
 ```
 
-The token mapping authenticates a key; it does not create that principal in the database. For the
-first authenticated startup of a new deployment, configure all three values together:
+For a shared or remote deployment, configure the token map and disable unauthenticated local
+access:
 
 ```dotenv
 SKILLWRIGHT_ALLOW_UNAUTHENTICATED_LOCAL=false
-SKILLWRIGHT_BOOTSTRAP_ADMIN_PRINCIPAL=ops-admin
-SKILLWRIGHT_AUTH_TOKEN_HASHES={"<sha256-digest>":"ops-admin"}
+SKILLWRIGHT_AUTH_TOKEN_HASHES={"<sha256-digest>":"automation-service"}
 ```
 
-Start the service once, verify the administrator exists, then remove
-`SKILLWRIGHT_BOOTSTRAP_ADMIN_PRINCIPAL`. Bootstrap creation is one-time: if that key already exists,
-startup does not promote or otherwise overwrite its role. An authenticated administrator can then
-use `principal_set_role` to create or change additional principals and `principal_set_disabled` to
-disable or re-enable them. Add each service's token digest to `SKILLWRIGHT_AUTH_TOKEN_HASHES` with
-the same external key used for its provisioned principal.
+A valid token automatically creates its principal identity on first use. Principals exist only for
+attribution, audit records, idempotency/request ownership, and browser-session isolation. There are
+no roles, per-skill grants, administrator accounts, or disabled-principal state; every authenticated
+principal has the same product capabilities.
 
 For MCP deployments that validate an explicit resource, set
 `SKILLWRIGHT_MCP_RESOURCE_SERVER_URL` to the externally visible MCP URL. The issuer reported by the
@@ -262,27 +258,18 @@ overwriting a newer version.
 
 ## Secret-safe recording and execution
 
-Secrets require the explicit secret path. Skillwright supports three server-side providers:
+Secrets require the explicit secret path. Skillwright supports the `env` provider: a logical
+reference such as `LOGIN_PASSWORD` resolves to `SKILLWRIGHT_SECRET_LOGIN_PASSWORD`, and references
+must match `[A-Z][A-Z0-9_]*`. Plaintext values are read only when needed and are not cached by
+Skillwright.
 
-- `env`: a logical reference such as `LOGIN_PASSWORD` resolves to
-  `SKILLWRIGHT_SECRET_LOGIN_PASSWORD`; env refs must match `[A-Z][A-Z0-9_]*`;
-- `aws-secrets-manager`: resolves a Secrets Manager name or full ARN and requires a string secret;
-- `aws-ssm`: resolves an SSM Parameter Store name/ARN with decryption enabled.
-
-AWS lookups use the standard AWS SDK credential chain (the ECS task role in the included AWS
-deployment) and run outside the asyncio event loop. SDK clients may be reused, but plaintext secret
-values are never cached by Skillwright. Managed-provider calls are bounded by
-`SKILLWRIGHT_AWS_SECRET_RESOLUTION_TIMEOUT_SECONDS` (15 seconds by default, capped below the
-minimum stale-run window); the included ECS deployment resolves secrets in its configured region.
-
-For the env provider, configure the value only in the process that needs to execute or demonstrate
-the secret action:
+Configure the value only in the process that needs to execute or demonstrate the secret action:
 
 ```dotenv
 SKILLWRIGHT_SECRET_LOGIN_PASSWORD=<secret value>
 ```
 
-During recording, an administrator uses `browser_fill_secret` instead of `browser_fill`:
+During recording, use `browser_fill_secret` instead of `browser_fill`:
 
 ```text
 skill_record_start(name="portal-login")
@@ -304,13 +291,12 @@ value, and redacts raw and URL-encoded variants from captured browser results an
 in that browser session. Compilation creates a required secret string input such as
 `{{ password }}` and automatically binds that input to the recorded secret reference.
 
-Use `skill_secret_status` to see which secret inputs are configured and which provider backs them
-without exposing their refs or values. Administrators with `manage` permission can change a binding
-with `skill_secret_bind(name, input_name, secret_ref, provider=...)` or remove it with
-`skill_secret_unbind`. A run with a missing binding returns `secret_unavailable`; if the binding
-exists but its provider cannot resolve a non-empty string when execution begins or resumes, the run
-fails before that browser action starts. Values are resolved again after approval/repair resumption,
-so rotating an env, Secrets Manager, or SSM value does not require a workflow-version change.
+Use `skill_secret_status` to see which secret inputs are configured without exposing their refs or
+values. `skill_secret_bind(name, input_name, secret_ref)` changes a binding and
+`skill_secret_unbind` removes it. A run with a missing binding returns `secret_unavailable`; if the
+binding cannot resolve a non-empty environment value when execution begins or resumes, the run fails
+before that browser action starts. Values are resolved again after approval/repair resumption, so
+rotating an environment value does not require a workflow-version change.
 
 `browser_fill` is **not secret-safe**. Its `text` argument is ordinary browser input and can be
 stored in browser-action history, snapshots, run evidence, and logs/results. Never put credentials
@@ -419,32 +405,12 @@ Use `skill_versions(name)` to inspect version history. `skill_rollback(name, ver
 preserves immutability: it copies the selected historical definition into a new current version
 instead of moving or editing old version rows.
 
-## RBAC
+## Access model
 
-Roles are `admin`, `developer`, and `viewer`. Per-skill permissions are `view`, `run`, `edit`,
-`approve`, and `manage`.
-
-| Role | Global capabilities | Skill behavior |
-| --- | --- | --- |
-| `admin` | Browser tools, skill creation, principal administration, secret administration | All permissions on all skills |
-| `developer` | Browser tools and skill creation | Full permissions on owned skills; otherwise only explicitly granted permissions |
-| `viewer` | No browser or skill-creation capability | `view` only, for skills they still own or where `view` is explicitly granted |
-
-Per-skill permissions control these operations:
-
-| Permission | Representative operations |
-| --- | --- |
-| `view` | `skill_get`, `skill_versions`, `skill_status`, visibility in list/search |
-| `run` | `skill_run`, `skill_cancel` |
-| `edit` | `skill_parameterize`, `skill_approval_set`, `skill_repair`, `skill_rollback` |
-| `approve` | `skill_approval_decide` and approval intervention access |
-| `manage` | `skill_access_grant`, `skill_access_revoke`, `skill_access_get`, `skill_secret_status`; secret binding/unbinding also requires global admin |
-
-Principals with `manage` permission can grant/revoke per-skill permissions with
-`skill_access_grant` and `skill_access_revoke`; `skill_access_get` lists current grants.
-`principal_set_role` and
-`principal_set_disabled` are administrator-only. Disabled principals are rejected even if a token
-mapping or skill grant still exists.
+Authentication is the only application access gate. Every authenticated principal can use browser
+tools, create or modify skills, execute/cancel/repair runs, decide approvals, manage environment
+secret bindings, and inspect the shared skill catalog. Principal identity is still attached to audit
+records and browser sessions, but it is not an authorization role.
 
 The MCP server currently exposes these product tools:
 
@@ -454,8 +420,7 @@ The MCP server currently exposes these product tools:
 | Record/discover | `skill_record_start`, `skill_record_stop`, `skill_save_from_history`, `skill_list`, `skill_search`, `skill_get` |
 | Author/configure | `skill_parameterize`, `skill_secret_bind`, `skill_secret_unbind`, `skill_secret_status`, `skill_approval_set` |
 | Execute/intervene | `skill_run`, `skill_status`, `skill_cancel`, `skill_repair`, `skill_approval_decide` |
-| Version/access | `skill_versions`, `skill_rollback`, `skill_access_grant`, `skill_access_revoke`, `skill_access_get` |
-| Principals | `principal_set_role`, `principal_set_disabled` |
+| Versions | `skill_versions`, `skill_rollback` |
 
 ## Control API
 
@@ -463,16 +428,16 @@ The control API operates existing skills and runs; skill recording and authoring
 `/health/live` and `/health/ready` are health endpoints. `/api/v1/*` requests require a valid bearer
 token unless loopback-only unauthenticated local mode is explicitly enabled.
 
-| Method | Endpoint | Purpose / required skill permission |
+| Method | Endpoint | Purpose |
 | --- | --- | --- |
 | `GET` | `/health/live` | Process liveness |
 | `GET` | `/health/ready` | PostgreSQL connectivity, expected Alembic schema head, and (for Redis execution) Redis readiness |
-| `POST` | `/api/v1/runs` | Create/queue a run; `run` |
-| `GET` | `/api/v1/runs/{run_id}` | Safe persisted run status; `view` |
-| `POST` | `/api/v1/runs/{run_id}/cancel` | Request cancellation; `run` |
-| `GET` | `/api/v1/runs/{run_id}/intervention` | Fetch current repair/approval context; `edit` for repair, `approve` for approval |
-| `POST` | `/api/v1/runs/{run_id}/repair` | Submit `step`, `replacement_element_id`, and optional `persist`; `edit` |
-| `POST` | `/api/v1/approvals/{approval_id}/decision` | Submit `approve` and optional `comment`; `approve` |
+| `POST` | `/api/v1/runs` | Create/queue a run |
+| `GET` | `/api/v1/runs/{run_id}` | Safe persisted run status |
+| `POST` | `/api/v1/runs/{run_id}/cancel` | Request cancellation |
+| `GET` | `/api/v1/runs/{run_id}/intervention` | Fetch current repair/approval context |
+| `POST` | `/api/v1/runs/{run_id}/repair` | Submit `step`, `replacement_element_id`, and optional `persist` |
+| `POST` | `/api/v1/approvals/{approval_id}/decision` | Submit `approve` and optional `comment` |
 
 Create a run over HTTP with:
 
@@ -486,7 +451,7 @@ curl -X POST http://127.0.0.1:8767/api/v1/runs \
 The create/status response intentionally contains run metadata (`run_id`, status, pinned workflow
 version, current step, cancellation flag, and timestamps) rather than the input payload, outputs,
 or raw failure context. Fetch structured repair/approval data only through the intervention
-endpoint, where the corresponding skill permission is enforced.
+endpoint, which requires the same bearer authentication as the other control endpoints.
 
 ## Observability
 
@@ -551,31 +516,6 @@ should still keep secrets out of every ordinary/non-secret input field.
   duplicate side effect after worker loss.
 - The repository is backend-only. It currently ships no web frontend and no Kubernetes manifests.
   Docker/Compose is the included deployment topology.
-
-## AWS / ECS deployment
-
-Production-oriented Terraform now lives in `infra/aws/terraform`. It provisions an immutable ECR
-repository; separate API, stateful MCP, and deterministic worker ECS/Fargate services; a one-off
-Alembic migration task; RDS PostgreSQL with separate administrator and least-privilege runtime
-identities; encrypted TLS-only ElastiCache Redis; an HTTPS ALB; ADOT sidecars exporting traces to
-X-Ray and metrics through EMF; CloudWatch logs; per-purpose task IAM policies; a digest-pinned ADOT
-collector; autoscaling hooks; and backup/retention controls.
-
-The stack keeps application tasks, RDS, and Redis in private subnets. RDS's AWS-managed master
-credential is injected only into the one-off migration task. That task initializes a separate
-Secrets Manager credential and constrained PostgreSQL login for the API, MCP, and worker services;
-the runtime login cannot create roles/databases or mutate the Alembic version marker. PostgreSQL
-connections use `verify-full` TLS with the AWS RDS global CA bundle checksum-pinned into the image.
-Workflow Secrets Manager/SSM access is granted separately from explicit ARN allow-lists.
-
-The current Streamable HTTP MCP process owns interactive browser sessions in memory. The Terraform
-MCP target group therefore enables ALB cookie stickiness, and the MCP process uses ECS task scale-in
-protection while it owns interactive sessions so rolling deployments/autoscaling do not drain that
-task mid-session. Clients must retain the ALB cookie for the MCP session. A migration-image marker
-also gates all service promotion: a candidate image must run the migration task successfully before
-Terraform can roll API/MCP/worker services to that tag. See `infra/aws/terraform/README.md` for the
-exact release sequence, network requirements, secret-provider permissions, and operational
-controls. No Kubernetes layer or frontend is part of the deployment.
 
 ## Container image
 
@@ -666,12 +606,10 @@ The host ports can be changed with `SKILLWRIGHT_COMPOSE_POSTGRES_PORT`,
 possible to run isolated smoke or development stacks side by side.
 
 Compose keeps unauthenticated local access disabled. `SKILLWRIGHT_AUTH_TOKEN_HASHES` is a JSON
-mapping from SHA-256 token digests to provisioned principal keys; raw bearer tokens must not be
-put in that setting. A new deployment must also provision that principal. For initial bootstrap,
-set `SKILLWRIGHT_BOOTSTRAP_ADMIN_PRINCIPAL` to the same principal key for the first authenticated
-startup, then remove the bootstrap setting after the administrator exists. The Compose file does
-not forward arbitrary host environment variables into containers. If a workflow uses
-environment-backed secrets, add only the required
+mapping from SHA-256 token digests to principal keys; raw bearer tokens must not be put in that
+setting. The first valid request for a mapped key creates its attribution identity automatically.
+The Compose file does not forward arbitrary host environment variables into containers. If a
+workflow uses environment-backed secrets, add only the required
 `SKILLWRIGHT_SECRET_*` keys to the `mcp` and `worker` service environments in a deployment
 override.
 

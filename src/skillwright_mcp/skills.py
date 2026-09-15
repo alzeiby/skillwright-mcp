@@ -74,17 +74,13 @@ class SkillService:
                 "recording_id": recording_id,
                 "error": str(exc),
             }
-        try:
-            skill, version = await self.database.create_skill_version(
-                workflow,
-                owner_principal_id=owner_principal_id,
-                actor_principal_id=owner_principal_id,
-                recording_id=recording_id,
-                change_reason="recording",
-            )
-        except PermissionError as exc:
-            await self.database.stop_recording(recording_id, status="forbidden")
-            return {"status": "forbidden", "error": str(exc)}
+        skill, version = await self.database.create_skill_version(
+            workflow,
+            owner_principal_id=owner_principal_id,
+            actor_principal_id=owner_principal_id,
+            recording_id=recording_id,
+            change_reason="recording",
+        )
         await self._bind_recorded_secrets(
             skill_id=skill.id,
             actions=actions,
@@ -127,15 +123,12 @@ class SkillService:
             workflow = compile_actions(name=name, description=description, actions=actions)
         except WorkflowCompilationError as exc:
             return {"status": "compile_failed", "error": str(exc)}
-        try:
-            skill, version = await self.database.create_skill_version(
-                workflow,
-                owner_principal_id=owner_principal_id,
-                actor_principal_id=owner_principal_id,
-                change_reason=f"history events {start_event}-{end_event}",
-            )
-        except PermissionError as exc:
-            return {"status": "forbidden", "error": str(exc)}
+        skill, version = await self.database.create_skill_version(
+            workflow,
+            owner_principal_id=owner_principal_id,
+            actor_principal_id=owner_principal_id,
+            change_reason=f"history events {start_event}-{end_event}",
+        )
         await self._bind_recorded_secrets(
             skill_id=skill.id,
             actions=actions,
@@ -223,15 +216,12 @@ class SkillService:
             return {"status": "not_found", "skill": name, "version": version}
         skill, old_version = stored
         workflow = WorkflowDefinition.model_validate(old_version.definition)
-        try:
-            _, new_version = await self.database.create_skill_version(
-                workflow,
-                actor_principal_id=actor_principal_id,
-                parent_version=skill.current_version,
-                change_reason=f"rollback to v{version}",
-            )
-        except PermissionError as exc:
-            return {"status": "forbidden", "error": str(exc)}
+        _, new_version = await self.database.create_skill_version(
+            workflow,
+            actor_principal_id=actor_principal_id,
+            parent_version=skill.current_version,
+            change_reason=f"rollback to v{version}",
+        )
         return {
             "status": "saved",
             "skill": name,
@@ -300,8 +290,6 @@ class SkillService:
                 change_reason="parameterized inputs",
                 expected_current_version=version.version,
             )
-        except PermissionError as exc:
-            return {"status": "forbidden", "error": str(exc)}
         except ValueError as exc:
             return {"status": "conflict", "error": str(exc)}
         return {
@@ -456,8 +444,6 @@ class SkillService:
                 ),
                 expected_current_version=version.version,
             )
-        except PermissionError as exc:
-            return {"status": "forbidden", "error": str(exc)}
         except ValueError as exc:
             return {"status": "conflict", "error": str(exc)}
         return {

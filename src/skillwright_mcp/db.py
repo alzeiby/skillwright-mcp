@@ -34,7 +34,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from .workflow import WorkflowDefinition
 
 JsonType = JSON().with_variant(JSONB, "postgresql")
-SCHEMA_REVISION = "b71e2a4c9d30"
+SCHEMA_REVISION = "6f4c2a1d9e8b"
 
 
 def _now() -> datetime:
@@ -54,8 +54,6 @@ class PrincipalRow(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     external_key: Mapped[str] = mapped_column(String(512), unique=True, nullable=False, index=True)
-    role: Mapped[str] = mapped_column(String(32), nullable=False, default="viewer")
-    disabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, nullable=False
     )
@@ -143,29 +141,6 @@ class SkillRow(Base):
         DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
     )
 
-
-class SkillPermissionRow(Base):
-    __tablename__ = "skill_permissions"
-    __table_args__ = (
-        UniqueConstraint(
-            "skill_id",
-            "principal_id",
-            "permission",
-            name="uq_skill_permission",
-        ),
-    )
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    skill_id: Mapped[str] = mapped_column(
-        ForeignKey("skills.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    principal_id: Mapped[str] = mapped_column(
-        ForeignKey("principals.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    permission: Mapped[str] = mapped_column(String(24), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_now, nullable=False
-    )
 
 
 class SkillSecretBindingRow(Base):
@@ -413,14 +388,14 @@ class Database:
     async def close(self) -> None:
         await self.engine.dispose()
 
-    async def ensure_principal(self, external_key: str, role: str = "viewer") -> PrincipalRow:
+    async def ensure_principal(self, external_key: str) -> PrincipalRow:
         async with self.sessions.begin() as session:
             row = await session.scalar(
                 select(PrincipalRow).where(PrincipalRow.external_key == external_key)
             )
             if row is not None:
                 return row
-            row = PrincipalRow(external_key=external_key, role=role)
+            row = PrincipalRow(external_key=external_key)
             session.add(row)
             try:
                 await session.flush()
@@ -447,97 +422,6 @@ class Database:
                     select(PrincipalRow).where(PrincipalRow.external_key == external_key)
                 ),
             )
-
-    async def set_principal_role(self, external_key: str, role: str) -> PrincipalRow:
-        async with self.sessions.begin() as session:
-            row = await session.scalar(
-                select(PrincipalRow)
-                .where(PrincipalRow.external_key == external_key)
-                .with_for_update()
-            )
-            if row is None:
-                row = PrincipalRow(external_key=external_key, role=role)
-                session.add(row)
-            else:
-                row.role = role
-            await session.flush()
-            return row
-
-    async def set_principal_disabled(self, external_key: str, disabled: bool) -> PrincipalRow:
-        async with self.sessions.begin() as session:
-            row = await session.scalar(
-                select(PrincipalRow)
-                .where(PrincipalRow.external_key == external_key)
-                .with_for_update()
-            )
-            if row is None:
-                raise KeyError(f"principal not found: {external_key}")
-            row.disabled = disabled
-            await session.flush()
-            return row
-
-    async def grant_skill_permission(
-        self,
-        skill_id: str,
-        principal_id: str,
-        permission: str,
-    ) -> SkillPermissionRow:
-        async with self.sessions.begin() as session:
-            existing = await session.scalar(
-                select(SkillPermissionRow).where(
-                    SkillPermissionRow.skill_id == skill_id,
-                    SkillPermissionRow.principal_id == principal_id,
-                    SkillPermissionRow.permission == permission,
-                )
-            )
-            if existing is not None:
-                return existing
-            row = SkillPermissionRow(
-                skill_id=skill_id,
-                principal_id=principal_id,
-                permission=permission,
-            )
-            session.add(row)
-            await session.flush()
-            return row
-
-    async def revoke_skill_permission(
-        self,
-        skill_id: str,
-        principal_id: str,
-        permission: str,
-    ) -> bool:
-        async with self.sessions.begin() as session:
-            row = await session.scalar(
-                select(SkillPermissionRow).where(
-                    SkillPermissionRow.skill_id == skill_id,
-                    SkillPermissionRow.principal_id == principal_id,
-                    SkillPermissionRow.permission == permission,
-                )
-            )
-            if row is None:
-                return False
-            await session.delete(row)
-            return True
-
-    async def skill_permissions(self, skill_id: str, principal_id: str) -> set[str]:
-        async with self.sessions() as session:
-            result = await session.scalars(
-                select(SkillPermissionRow.permission).where(
-                    SkillPermissionRow.skill_id == skill_id,
-                    SkillPermissionRow.principal_id == principal_id,
-                )
-            )
-            return set(result.all())
-
-    async def list_skill_permissions(self, skill_id: str) -> Sequence[SkillPermissionRow]:
-        async with self.sessions() as session:
-            result = await session.scalars(
-                select(SkillPermissionRow)
-                .where(SkillPermissionRow.skill_id == skill_id)
-                .order_by(SkillPermissionRow.principal_id, SkillPermissionRow.permission)
-            )
-            return result.all()
 
     async def bind_skill_secret(
         self,
@@ -611,23 +495,6 @@ class Database:
                     )
                 ),
             )
-
-    async def list_skills_for_principal(self, principal: PrincipalRow) -> Sequence[SkillRow]:
-        if principal.role == "admin":
-            return await self.list_skills()
-        async with self.sessions() as session:
-            permitted_skill_ids = select(SkillPermissionRow.skill_id).where(
-                SkillPermissionRow.principal_id == principal.id
-            )
-            result = await session.scalars(
-                select(SkillRow)
-                .where(
-                    (SkillRow.owner_principal_id == principal.id)
-                    | SkillRow.id.in_(permitted_skill_ids)
-                )
-                .order_by(SkillRow.name)
-            )
-            return result.all()
 
     async def start_recording(
         self,
@@ -772,29 +639,6 @@ class Database:
                 )
                 session.add(skill)
                 await session.flush()
-            else:
-                effective_actor_id = actor_principal_id or owner_principal_id
-                if effective_actor_id is not None:
-                    actor = await session.get(PrincipalRow, effective_actor_id)
-                    if actor is None or actor.disabled:
-                        raise PermissionError("skill version actor is unavailable")
-                    if actor.role != "admin":
-                        if actor.role != "developer":
-                            raise PermissionError(
-                                f"principal cannot edit existing skill {definition.name!r}"
-                            )
-                        if skill.owner_principal_id != actor.id:
-                            editable = await session.scalar(
-                                select(SkillPermissionRow.id).where(
-                                    SkillPermissionRow.skill_id == skill.id,
-                                    SkillPermissionRow.principal_id == actor.id,
-                                    SkillPermissionRow.permission == "edit",
-                                )
-                            )
-                            if editable is None:
-                                raise PermissionError(
-                                    f"principal cannot edit existing skill {definition.name!r}"
-                                )
             if (
                 expected_current_version is not None
                 and skill.current_version != expected_current_version

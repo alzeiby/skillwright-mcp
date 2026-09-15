@@ -108,7 +108,7 @@ def _runtime_factory(settings: Settings) -> Runtime:
 
 
 @pytest.mark.asyncio
-async def test_control_api_create_status_cancel_uses_rbac_and_safe_run_shape(
+async def test_control_api_create_status_cancel_uses_authentication_and_safe_run_shape(
     tmp_path: Path,
 ) -> None:
     settings = Settings(
@@ -117,14 +117,13 @@ async def test_control_api_create_status_cancel_uses_rbac_and_safe_run_shape(
         execution_backend="inline",
         allow_unauthenticated_local=True,
         local_principal="api-admin@example.test",
-        local_role="admin",
     )
     app = create_app(settings, runtime_factory=_runtime_factory)
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 50000))
 
     async with app.router.lifespan_context(app):
         runtime = cast(Runtime, app.state.runtime)
-        owner = await runtime.authorization.local_principal()
+        owner = await runtime.identity.local_principal()
         await runtime.database.create_skill_version(
             WorkflowDefinition.model_validate(
                 {
@@ -250,7 +249,7 @@ async def test_local_unauthenticated_control_access_is_loopback_only(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_control_api_accepts_hashed_bearer_token_for_provisioned_principal(
+async def test_control_api_accepts_hashed_bearer_token_and_auto_provisions_principal(
     tmp_path: Path,
 ) -> None:
     token = "test-service-token-with-high-entropy-placeholder"
@@ -267,12 +266,16 @@ async def test_control_api_accepts_hashed_bearer_token_for_provisioned_principal
 
     async with app.router.lifespan_context(app):
         runtime = cast(Runtime, app.state.runtime)
-        principal = await runtime.database.ensure_principal("api-service@example.test", "admin")
+        assert (
+            await runtime.database.get_principal_by_external_key("api-service@example.test") is None
+        )
         await runtime.database.create_skill_version(
             WorkflowDefinition.model_validate(
-                {"name": "bearer-skill", "steps": [{"op": "navigate", "url": "https://example.test"}]}
-            ),
-            owner_principal_id=principal.id,
+                {
+                    "name": "bearer-skill",
+                    "steps": [{"op": "navigate", "url": "https://example.test"}],
+                }
+            )
         )
 
         async with httpx.AsyncClient(
@@ -294,6 +297,10 @@ async def test_control_api_accepts_hashed_bearer_token_for_provisioned_principal
             )
             assert created.status_code == 202
             assert created.json()["status"] == "queued"
+            principal = await runtime.database.get_principal_by_external_key(
+                "api-service@example.test"
+            )
+            assert principal is not None
 
 
 @pytest.mark.asyncio
@@ -306,17 +313,15 @@ async def test_control_api_repair_and_approval_interventions_are_authorized_and_
         execution_backend="inline",
         allow_unauthenticated_local=True,
         local_principal="intervention-admin@example.test",
-        local_role="admin",
     )
     app = create_app(settings, runtime_factory=_runtime_factory)
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 50000))
 
     async with app.router.lifespan_context(app):
         runtime = cast(Runtime, app.state.runtime)
-        principal = await runtime.authorization.local_principal()
+        principal = await runtime.identity.local_principal()
         original_requester = await runtime.database.ensure_principal(
-            "original-requester@example.test",
-            "developer",
+            "original-requester@example.test"
         )
         skill, version = await runtime.database.create_skill_version(
             WorkflowDefinition.model_validate(
@@ -391,9 +396,7 @@ async def test_control_api_repair_and_approval_interventions_are_authorized_and_
         )
 
         async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
-            repair_view = await client.get(
-                f"/api/v1/runs/{repair_run.id}/intervention"
-            )
+            repair_view = await client.get(f"/api/v1/runs/{repair_run.id}/intervention")
             assert repair_view.status_code == 200
             assert repair_view.json()["type"] == "repair"
             assert repair_view.json()["candidates"][0]["id"] == "candidate-0"
@@ -429,9 +432,7 @@ async def test_control_api_repair_and_approval_interventions_are_authorized_and_
             assert stored_repair.status == "cancelled"
             assert stored_repair.completed_at is not None
 
-            approval_view = await client.get(
-                f"/api/v1/runs/{approval_run.id}/intervention"
-            )
+            approval_view = await client.get(f"/api/v1/runs/{approval_run.id}/intervention")
             assert approval_view.status_code == 200
             assert approval_view.json()["type"] == "approval"
             assert approval_view.json()["approval_id"] == approval.id

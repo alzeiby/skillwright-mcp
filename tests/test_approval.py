@@ -48,7 +48,9 @@ class ApprovalFixturePlaywright:
         )
 
 
-async def _approval_runtime(tmp_path: Any) -> tuple[
+async def _approval_runtime(
+    tmp_path: Any,
+) -> tuple[
     Database,
     WorkflowEngine,
     RunDispatcher,
@@ -57,7 +59,7 @@ async def _approval_runtime(tmp_path: Any) -> tuple[
 ]:
     database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'approval.db').as_posix()}")
     await database.initialize(create_schema=True)
-    requester = await database.ensure_principal("requester@example.test", "developer")
+    requester = await database.ensure_principal("requester@example.test")
     workflow = WorkflowDefinition.model_validate(
         {
             "name": "publish-draft",

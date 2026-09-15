@@ -14,13 +14,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from . import __version__
-from .auth import (
-    AuthorizationError,
-    BearerTokenAuthenticator,
-    MCPBearerTokenVerifier,
-    Role,
-    SkillPermission,
-)
+from .auth import AuthenticationError, BearerTokenAuthenticator, MCPBearerTokenVerifier
 from .browser import BrowserController
 from .config import Settings
 from .db import PrincipalRow, RunRow, SkillRow
@@ -162,33 +156,30 @@ async def _principal(ctx: Context[AppContext]) -> PrincipalRow:
     if access_token is not None:
         external_key = (access_token.claims or {}).get("skillwright_external_key")
         if isinstance(external_key, str):
-            return await app.authorization.authenticated_principal(external_key)
+            return await app.identity.authenticated_principal(external_key)
     external_key = authenticated_principal(ctx.request_context)
     if external_key is not None:
-        return await app.authorization.authenticated_principal(external_key)
+        return await app.identity.authenticated_principal(external_key)
     if app.settings.allow_unauthenticated_local:
-        return await app.authorization.local_principal()
-    raise AuthorizationError("authentication is required", code="authentication_required")
+        return await app.identity.local_principal()
+    raise AuthenticationError("authentication is required")
 
 
 async def _skill(
     ctx: Context[AppContext],
     name: str,
-    permission: SkillPermission,
 ) -> tuple[PrincipalRow, SkillRow]:
     app = _app(ctx)
     principal = await _principal(ctx)
     skill = await app.database.get_skill(name)
     if skill is None:
         raise KeyError(f"skill not found: {name}")
-    await app.authorization.require_skill(principal, skill, permission)
     return principal, skill
 
 
 async def _run(
     ctx: Context[AppContext],
     run_id: str,
-    permission: SkillPermission,
 ) -> tuple[PrincipalRow, RunRow, SkillRow]:
     app = _app(ctx)
     principal = await _principal(ctx)
@@ -198,7 +189,6 @@ async def _run(
     skill = await app.database.get_skill_by_id(run.skill_id)
     if skill is None:
         raise KeyError(f"skill for run not found: {run_id}")
-    await app.authorization.require_skill(principal, skill, permission)
     return principal, run, skill
 
 
@@ -206,9 +196,7 @@ async def _run(
 async def browser_navigate(url: str, ctx: Context[AppContext]) -> dict[str, Any]:
     """Navigate the current browser to a URL and record the action in Skillwright history."""
 
-    app = _app(ctx)
     principal = await _principal(ctx)
-    app.authorization.require_global(principal, "browser")
     async with _browser_session(ctx, principal) as browser:
         return (await browser.navigate(url, actor_principal_id=principal.id)).as_dict()
 
@@ -221,9 +209,7 @@ async def browser_snapshot(
 ) -> dict[str, Any]:
     """Capture the current Playwright accessibility snapshot."""
 
-    app = _app(ctx)
     principal = await _principal(ctx)
-    app.authorization.require_global(principal, "browser")
     async with _browser_session(ctx, principal) as browser:
         return (
             await browser.snapshot(
@@ -244,9 +230,7 @@ async def browser_click(
 ) -> dict[str, Any]:
     """Click an element identified by a current Playwright snapshot target."""
 
-    app = _app(ctx)
     principal = await _principal(ctx)
-    app.authorization.require_global(principal, "browser")
     async with _browser_session(ctx, principal) as browser:
         return (
             await browser.click(
@@ -269,9 +253,7 @@ async def browser_fill(
 ) -> dict[str, Any]:
     """Fill an editable element through Playwright MCP."""
 
-    app = _app(ctx)
     principal = await _principal(ctx)
-    app.authorization.require_global(principal, "browser")
     async with _browser_session(ctx, principal) as browser:
         return (
             await browser.fill(
@@ -298,7 +280,6 @@ async def browser_fill_secret(
 
     app = _app(ctx)
     principal = await _principal(ctx)
-    app.authorization.require_global(principal, "admin")
     try:
         normalized_ref = validate_secret_ref(secret_ref, provider=provider)
         secret_value = await app.engine.secret_resolver.resolve(normalized_ref, provider=provider)
@@ -328,9 +309,7 @@ async def browser_select(
 ) -> dict[str, Any]:
     """Select one or more values in a dropdown through Playwright MCP."""
 
-    app = _app(ctx)
     principal = await _principal(ctx)
-    app.authorization.require_global(principal, "browser")
     async with _browser_session(ctx, principal) as browser:
         return (
             await browser.select(
@@ -353,9 +332,7 @@ async def browser_wait(
 
     if seconds is None and text is None and text_gone is None:
         return {"ok": False, "error": "provide seconds, text, or text_gone"}
-    app = _app(ctx)
     principal = await _principal(ctx)
-    app.authorization.require_global(principal, "browser")
     async with _browser_session(ctx, principal) as browser:
         return (
             await browser.wait(
@@ -377,7 +354,6 @@ async def skill_record_start(
 
     app = _app(ctx)
     principal = await _principal(ctx)
-    app.authorization.require_global(principal, "create_skill")
     async with _browser_session(ctx, principal) as browser:
         skills = SkillService(app.database, browser, app.engine)
         return await skills.record_start(
@@ -393,7 +369,6 @@ async def skill_record_stop(ctx: Context[AppContext]) -> dict[str, Any]:
 
     app = _app(ctx)
     principal = await _principal(ctx)
-    app.authorization.require_global(principal, "create_skill")
     async with _browser_session(ctx, principal) as browser:
         skills = SkillService(app.database, browser, app.engine)
         return await skills.record_stop(owner_principal_id=principal.id)
@@ -411,7 +386,6 @@ async def skill_save_from_history(
 
     app = _app(ctx)
     principal = await _principal(ctx)
-    app.authorization.require_global(principal, "create_skill")
     return await app.skills.save_from_history(
         name,
         start_event=start_event,
@@ -426,8 +400,8 @@ async def skill_list(ctx: Context[AppContext]) -> dict[str, Any]:
     """List persisted skills and their current versions."""
 
     app = _app(ctx)
-    principal = await _principal(ctx)
-    rows = await app.authorization.visible_skills(principal)
+    await _principal(ctx)
+    rows = await app.database.list_skills()
     return {
         "skills": [
             {
@@ -436,7 +410,6 @@ async def skill_list(ctx: Context[AppContext]) -> dict[str, Any]:
                 "current_version": row.current_version,
             }
             for row in rows
-            if await app.authorization.can_skill(principal, row, "view")
         ]
     }
 
@@ -450,14 +423,11 @@ async def skill_search(
     """Search persisted skills by name and description."""
 
     app = _app(ctx)
-    principal = await _principal(ctx)
+    await _principal(ctx)
     needle = query.strip().casefold()
-    rows = await app.authorization.visible_skills(principal)
+    rows = await app.database.list_skills()
     matches = [
-        row
-        for row in rows
-        if await app.authorization.can_skill(principal, row, "view")
-        and (needle in row.name.casefold() or needle in row.description.casefold())
+        row for row in rows if needle in row.name.casefold() or needle in row.description.casefold()
     ][:limit]
     return {
         "query": query,
@@ -480,7 +450,7 @@ async def skill_get(
 ) -> dict[str, Any]:
     """Get one persisted workflow definition."""
 
-    await _skill(ctx, name, "view")
+    await _skill(ctx, name)
     return await _app(ctx).skills.get(name, version)
 
 
@@ -492,7 +462,7 @@ async def skill_parameterize(
 ) -> dict[str, Any]:
     """Replace recorded literals with typed workflow inputs and save a new version."""
 
-    principal, _ = await _skill(ctx, name, "edit")
+    principal, _ = await _skill(ctx, name)
     return await _app(ctx).skills.parameterize(
         name,
         bindings,
@@ -511,8 +481,7 @@ async def skill_secret_bind(
     """Bind a secret workflow input to a server-managed secret reference."""
 
     app = _app(ctx)
-    principal, _ = await _skill(ctx, name, "manage")
-    app.authorization.require_global(principal, "admin")
+    principal, _ = await _skill(ctx, name)
     return await app.skills.bind_secret(
         name,
         input_name=input_name,
@@ -531,8 +500,7 @@ async def skill_secret_unbind(
     """Remove a server-side binding for a secret workflow input."""
 
     app = _app(ctx)
-    principal, _ = await _skill(ctx, name, "manage")
-    app.authorization.require_global(principal, "admin")
+    principal, _ = await _skill(ctx, name)
     return await app.skills.unbind_secret(
         name,
         input_name=input_name,
@@ -544,7 +512,7 @@ async def skill_secret_unbind(
 async def skill_secret_status(name: str, ctx: Context[AppContext]) -> dict[str, Any]:
     """Show which secret inputs are configured without exposing references or values."""
 
-    await _skill(ctx, name, "manage")
+    await _skill(ctx, name)
     return await _app(ctx).skills.secret_status(name)
 
 
@@ -558,7 +526,7 @@ async def skill_approval_set(
 ) -> dict[str, Any]:
     """Add or remove a durable approval gate on a mutating workflow step."""
 
-    principal, _ = await _skill(ctx, name, "edit")
+    principal, _ = await _skill(ctx, name)
     return await _app(ctx).skills.set_approval_gate(
         name,
         step=step,
@@ -579,7 +547,7 @@ async def skill_run(
     """Queue a deterministic browser skill run (or execute inline in local development)."""
 
     app = _app(ctx)
-    principal, _ = await _skill(ctx, name, "run")
+    principal, _ = await _skill(ctx, name)
     return await app.dispatcher.submit(
         name,
         inputs=inputs,
@@ -593,7 +561,7 @@ async def skill_run(
 async def skill_status(run_id: str, ctx: Context[AppContext]) -> dict[str, Any]:
     """Inspect persisted status and failure context for a workflow run."""
 
-    await _run(ctx, run_id, "view")
+    await _run(ctx, run_id)
     return await _app(ctx).skills.status(run_id)
 
 
@@ -601,7 +569,7 @@ async def skill_status(run_id: str, ctx: Context[AppContext]) -> dict[str, Any]:
 async def skill_cancel(run_id: str, ctx: Context[AppContext]) -> dict[str, Any]:
     """Request cancellation of a queued or running skill execution."""
 
-    principal, _, _ = await _run(ctx, run_id, "run")
+    principal, _, _ = await _run(ctx, run_id)
     return await _app(ctx).dispatcher.cancel(
         run_id,
         actor_principal_id=principal.id,
@@ -618,7 +586,7 @@ async def skill_repair(
 ) -> dict[str, Any]:
     """Apply one candidate target repair, continue the run, and optionally save a new version."""
 
-    principal, _, _ = await _run(ctx, run_id, "edit")
+    principal, _, _ = await _run(ctx, run_id)
     return await _app(ctx).dispatcher.repair(
         run_id,
         step=step,
@@ -648,7 +616,6 @@ async def skill_approval_decide(
     skill = await app.database.get_skill_by_id(run.skill_id)
     if skill is None:
         raise KeyError(f"skill not found for approval: {approval_id}")
-    await app.authorization.require_skill(principal, skill, "approve")
     result = await app.dispatcher.decide_approval(
         approval_id,
         approve=approve,
@@ -670,7 +637,7 @@ async def skill_approval_decide(
 async def skill_versions(name: str, ctx: Context[AppContext]) -> dict[str, Any]:
     """List immutable versions of a persisted skill."""
 
-    await _skill(ctx, name, "view")
+    await _skill(ctx, name)
     return await _app(ctx).skills.versions(name)
 
 
@@ -682,124 +649,9 @@ async def skill_rollback(
 ) -> dict[str, Any]:
     """Create a new current version whose definition matches an older skill version."""
 
-    principal, _ = await _skill(ctx, name, "edit")
+    principal, _ = await _skill(ctx, name)
     return await _app(ctx).skills.rollback(
         name,
         version,
         actor_principal_id=principal.id,
     )
-
-
-@mcp.tool()
-async def principal_set_role(
-    external_key: str,
-    role: Role,
-    ctx: Context[AppContext],
-) -> dict[str, Any]:
-    """Create or update a Skillwright principal role. Admin only."""
-
-    app = _app(ctx)
-    actor = await _principal(ctx)
-    app.authorization.require_global(actor, "admin")
-    principal = await app.database.set_principal_role(external_key, role)
-    await app.database.audit(
-        "principal.role.updated",
-        principal_id=actor.id,
-        entity_type="principal",
-        entity_id=principal.id,
-        data={"role": role},
-    )
-    return {"status": "saved", "principal": external_key, "role": principal.role}
-
-
-@mcp.tool()
-async def principal_set_disabled(
-    external_key: str,
-    disabled: bool,
-    ctx: Context[AppContext],
-) -> dict[str, Any]:
-    """Enable or disable a provisioned principal. Admin only."""
-
-    app = _app(ctx)
-    actor = await _principal(ctx)
-    app.authorization.require_global(actor, "admin")
-    principal = await app.database.set_principal_disabled(external_key, disabled)
-    await app.database.audit(
-        "principal.disabled.updated",
-        principal_id=actor.id,
-        entity_type="principal",
-        entity_id=principal.id,
-        data={"disabled": disabled},
-    )
-    return {"status": "saved", "principal": external_key, "disabled": disabled}
-
-
-@mcp.tool()
-async def skill_access_grant(
-    name: str,
-    principal_external_key: str,
-    permission: SkillPermission,
-    ctx: Context[AppContext],
-) -> dict[str, Any]:
-    """Grant one per-skill permission to a provisioned principal."""
-
-    app = _app(ctx)
-    actor, skill = await _skill(ctx, name, "manage")
-    target = await app.database.get_principal_by_external_key(principal_external_key)
-    if target is None:
-        raise KeyError(f"principal not found: {principal_external_key}")
-    await app.authorization.grant(actor, skill, target, permission)
-    await app.database.audit(
-        "skill.permission.granted",
-        principal_id=actor.id,
-        entity_type="skill",
-        entity_id=skill.id,
-        data={"target_principal_id": target.id, "permission": permission},
-    )
-    return {"status": "saved", "skill": name, "permission": permission}
-
-
-@mcp.tool()
-async def skill_access_revoke(
-    name: str,
-    principal_external_key: str,
-    permission: SkillPermission,
-    ctx: Context[AppContext],
-) -> dict[str, Any]:
-    """Revoke one per-skill permission from a principal."""
-
-    app = _app(ctx)
-    actor, skill = await _skill(ctx, name, "manage")
-    target = await app.database.get_principal_by_external_key(principal_external_key)
-    if target is None:
-        raise KeyError(f"principal not found: {principal_external_key}")
-    removed = await app.authorization.revoke(actor, skill, target, permission)
-    await app.database.audit(
-        "skill.permission.revoked",
-        principal_id=actor.id,
-        entity_type="skill",
-        entity_id=skill.id,
-        data={"target_principal_id": target.id, "permission": permission, "removed": removed},
-    )
-    return {"status": "saved", "skill": name, "permission": permission, "removed": removed}
-
-
-@mcp.tool()
-async def skill_access_get(name: str, ctx: Context[AppContext]) -> dict[str, Any]:
-    """Inspect per-skill grants. Requires manage permission."""
-
-    app = _app(ctx)
-    _, skill = await _skill(ctx, name, "manage")
-    rows = await app.database.list_skill_permissions(skill.id)
-    grants = []
-    for row in rows:
-        principal = await app.database.get_principal(row.principal_id)
-        if principal is not None:
-            grants.append(
-                {
-                    "principal": principal.external_key,
-                    "role": principal.role,
-                    "permission": row.permission,
-                }
-            )
-    return {"status": "found", "skill": name, "grants": grants}

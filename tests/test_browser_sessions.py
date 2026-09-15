@@ -50,22 +50,6 @@ class StatefulPlaywright:
         self.close_calls += 1
 
 
-class FakeTaskProtection:
-    def __init__(self) -> None:
-        self.protect_calls = 0
-        self.unprotect_calls = 0
-        self.protected = False
-
-    async def protect(self) -> None:
-        self.protect_calls += 1
-        self.protected = True
-
-    async def unprotect(self) -> None:
-        if self.protected:
-            self.unprotect_calls += 1
-            self.protected = False
-
-
 def _controller_factory(
     database: Database,
     playwrights: list[StatefulPlaywright],
@@ -223,41 +207,6 @@ async def test_browser_session_pool_reaps_abandoned_sessions_and_clears_state(
 
     assert len(playwrights) == 2
     assert all(playwright.close_calls == 1 for playwright in playwrights)
-
-
-@pytest.mark.asyncio
-async def test_browser_session_pool_protects_ecs_task_until_last_session_is_reaped(
-    tmp_path: Path,
-) -> None:
-    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'protection.db').as_posix()}")
-    await database.initialize(create_schema=True)
-    playwrights: list[StatefulPlaywright] = []
-    protection = FakeTaskProtection()
-    now = [100.0]
-    pool = BrowserSessionPool(
-        _controller_factory(database, playwrights),
-        idle_timeout_seconds=30.0,
-        cleanup_interval_seconds=10.0,
-        clock=lambda: now[0],
-        task_protection=cast(Any, protection),
-    )
-
-    try:
-        async with pool.use("principal:p:session:a"):
-            pass
-        async with pool.use("principal:p:session:b"):
-            pass
-        assert protection.protect_calls == 2
-        assert protection.unprotect_calls == 0
-
-        now[0] = 131.0
-        await pool.cleanup_idle()
-        assert protection.unprotect_calls == 1
-    finally:
-        await pool.close()
-        await database.close()
-
-    assert protection.unprotect_calls == 1
 
 
 @pytest.mark.asyncio
