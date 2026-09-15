@@ -50,7 +50,9 @@ terraform_prod() {
             ;;
         *)
             docker run --rm \
+                --user "$(id -u):$(id -g)" \
                 --add-host host.docker.internal:host-gateway \
+                -e HOME=/tmp \
                 -e AWS_ACCESS_KEY_ID=test \
                 -e AWS_SECRET_ACCESS_KEY=test \
                 -e AWS_DEFAULT_REGION=us-east-1 \
