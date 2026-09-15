@@ -21,6 +21,9 @@ class Settings(BaseSettings):
         "postgresql+asyncpg://skillwright:skillwright@127.0.0.1:54329/skillwright"
     )
     database_auto_create_schema: bool = False
+    allow_unauthenticated_local: bool = True
+    local_principal: str = "local"
+    local_role: Literal["admin", "developer", "viewer"] = "admin"
     execution_backend: Literal["inline", "redis"] = "redis"
     redis_url: str = "redis://127.0.0.1:63799/0"
     redis_queue_name: str = "skillwright-runs"

@@ -47,10 +47,31 @@ class Base(DeclarativeBase):
     pass
 
 
+class PrincipalRow(Base):
+    __tablename__ = "principals"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    external_key: Mapped[str] = mapped_column(String(512), unique=True, nullable=False, index=True)
+    role: Mapped[str] = mapped_column(String(32), nullable=False, default="viewer")
+    disabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+
 class RecordingRow(Base):
     __tablename__ = "recordings"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    owner_principal_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "principals.id",
+            ondelete="SET NULL",
+            name="fk_recordings_owner_principal_id",
+        ),
+        nullable=True,
+        index=True,
+    )
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="recording", nullable=False, index=True)
@@ -64,6 +85,15 @@ class BrowserActionRow(Base):
     __tablename__ = "browser_actions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    actor_principal_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "principals.id",
+            ondelete="SET NULL",
+            name="fk_browser_actions_actor_principal_id",
+        ),
+        nullable=True,
+        index=True,
+    )
     recording_id: Mapped[str | None] = mapped_column(
         ForeignKey("recordings.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -92,6 +122,15 @@ class SkillRow(Base):
     __tablename__ = "skills"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    owner_principal_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "principals.id",
+            ondelete="SET NULL",
+            name="fk_skills_owner_principal_id",
+        ),
+        nullable=True,
+        index=True,
+    )
     name: Mapped[str] = mapped_column(String(160), unique=True, nullable=False, index=True)
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     current_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -100,6 +139,30 @@ class SkillRow(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+
+
+class SkillPermissionRow(Base):
+    __tablename__ = "skill_permissions"
+    __table_args__ = (
+        UniqueConstraint(
+            "skill_id",
+            "principal_id",
+            "permission",
+            name="uq_skill_permission",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    skill_id: Mapped[str] = mapped_column(
+        ForeignKey("skills.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    principal_id: Mapped[str] = mapped_column(
+        ForeignKey("principals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    permission: Mapped[str] = mapped_column(String(24), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
     )
 
 
@@ -132,6 +195,15 @@ class RunRow(Base):
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    requested_by_principal_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "principals.id",
+            ondelete="SET NULL",
+            name="fk_runs_requested_by_principal_id",
+        ),
+        nullable=True,
+        index=True,
+    )
     skill_id: Mapped[str] = mapped_column(ForeignKey("skills.id", ondelete="CASCADE"), index=True)
     workflow_version_id: Mapped[str] = mapped_column(
         ForeignKey("workflow_versions.id", ondelete="RESTRICT"), index=True
@@ -208,6 +280,15 @@ class AuditEventRow(Base):
     __tablename__ = "audit_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    principal_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "principals.id",
+            ondelete="SET NULL",
+            name="fk_audit_events_principal_id",
+        ),
+        nullable=True,
+        index=True,
+    )
     event_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     actor: Mapped[str] = mapped_column(String(160), default="local", nullable=False)
     entity_type: Mapped[str | None] = mapped_column(String(80))
@@ -235,9 +316,162 @@ class Database:
     async def close(self) -> None:
         await self.engine.dispose()
 
-    async def start_recording(self, name: str, description: str = "") -> RecordingRow:
+    async def ensure_principal(self, external_key: str, role: str = "viewer") -> PrincipalRow:
         async with self.sessions.begin() as session:
-            row = RecordingRow(name=name, description=description)
+            row = await session.scalar(
+                select(PrincipalRow).where(PrincipalRow.external_key == external_key)
+            )
+            if row is not None:
+                return row
+            row = PrincipalRow(external_key=external_key, role=role)
+            session.add(row)
+            try:
+                await session.flush()
+            except IntegrityError:
+                await session.rollback()
+                async with self.sessions() as retry_session:
+                    existing = await retry_session.scalar(
+                        select(PrincipalRow).where(PrincipalRow.external_key == external_key)
+                    )
+                    if existing is None:
+                        raise
+                    return existing
+            return row
+
+    async def get_principal(self, principal_id: str) -> PrincipalRow | None:
+        async with self.sessions() as session:
+            return cast(PrincipalRow | None, await session.get(PrincipalRow, principal_id))
+
+    async def get_principal_by_external_key(self, external_key: str) -> PrincipalRow | None:
+        async with self.sessions() as session:
+            return cast(
+                PrincipalRow | None,
+                await session.scalar(
+                    select(PrincipalRow).where(PrincipalRow.external_key == external_key)
+                ),
+            )
+
+    async def set_principal_role(self, external_key: str, role: str) -> PrincipalRow:
+        async with self.sessions.begin() as session:
+            row = await session.scalar(
+                select(PrincipalRow)
+                .where(PrincipalRow.external_key == external_key)
+                .with_for_update()
+            )
+            if row is None:
+                row = PrincipalRow(external_key=external_key, role=role)
+                session.add(row)
+            else:
+                row.role = role
+            await session.flush()
+            return row
+
+    async def set_principal_disabled(self, external_key: str, disabled: bool) -> PrincipalRow:
+        async with self.sessions.begin() as session:
+            row = await session.scalar(
+                select(PrincipalRow)
+                .where(PrincipalRow.external_key == external_key)
+                .with_for_update()
+            )
+            if row is None:
+                raise KeyError(f"principal not found: {external_key}")
+            row.disabled = disabled
+            await session.flush()
+            return row
+
+    async def grant_skill_permission(
+        self,
+        skill_id: str,
+        principal_id: str,
+        permission: str,
+    ) -> SkillPermissionRow:
+        async with self.sessions.begin() as session:
+            existing = await session.scalar(
+                select(SkillPermissionRow).where(
+                    SkillPermissionRow.skill_id == skill_id,
+                    SkillPermissionRow.principal_id == principal_id,
+                    SkillPermissionRow.permission == permission,
+                )
+            )
+            if existing is not None:
+                return existing
+            row = SkillPermissionRow(
+                skill_id=skill_id,
+                principal_id=principal_id,
+                permission=permission,
+            )
+            session.add(row)
+            await session.flush()
+            return row
+
+    async def revoke_skill_permission(
+        self,
+        skill_id: str,
+        principal_id: str,
+        permission: str,
+    ) -> bool:
+        async with self.sessions.begin() as session:
+            row = await session.scalar(
+                select(SkillPermissionRow).where(
+                    SkillPermissionRow.skill_id == skill_id,
+                    SkillPermissionRow.principal_id == principal_id,
+                    SkillPermissionRow.permission == permission,
+                )
+            )
+            if row is None:
+                return False
+            await session.delete(row)
+            return True
+
+    async def skill_permissions(self, skill_id: str, principal_id: str) -> set[str]:
+        async with self.sessions() as session:
+            result = await session.scalars(
+                select(SkillPermissionRow.permission).where(
+                    SkillPermissionRow.skill_id == skill_id,
+                    SkillPermissionRow.principal_id == principal_id,
+                )
+            )
+            return set(result.all())
+
+    async def list_skill_permissions(self, skill_id: str) -> Sequence[SkillPermissionRow]:
+        async with self.sessions() as session:
+            result = await session.scalars(
+                select(SkillPermissionRow)
+                .where(SkillPermissionRow.skill_id == skill_id)
+                .order_by(SkillPermissionRow.principal_id, SkillPermissionRow.permission)
+            )
+            return result.all()
+
+    async def list_skills_for_principal(self, principal: PrincipalRow) -> Sequence[SkillRow]:
+        if principal.role == "admin":
+            return await self.list_skills()
+        async with self.sessions() as session:
+            permitted_skill_ids = select(SkillPermissionRow.skill_id).where(
+                SkillPermissionRow.principal_id == principal.id
+            )
+            result = await session.scalars(
+                select(SkillRow)
+                .where(
+                    (SkillRow.owner_principal_id == principal.id)
+                    | SkillRow.id.in_(permitted_skill_ids)
+                )
+                .order_by(SkillRow.name)
+            )
+            return result.all()
+
+    async def start_recording(
+        self,
+        name: str,
+        description: str = "",
+        *,
+        owner_principal_id: str | None = None,
+    ) -> RecordingRow:
+        async with self.sessions.begin() as session:
+            row = RecordingRow(
+                name=name,
+                description=description,
+                owner_principal_id=owner_principal_id,
+            )
             session.add(row)
             await session.flush()
             return row
@@ -267,9 +501,11 @@ class Database:
         upstream_arguments: dict[str, Any],
         snapshot_before: str | None,
         durable_locator: str | None,
+        actor_principal_id: str | None = None,
     ) -> BrowserActionRow:
         async with self.sessions.begin() as session:
             row = BrowserActionRow(
+                actor_principal_id=actor_principal_id,
                 recording_id=recording_id,
                 run_id=run_id,
                 source=source,
@@ -319,21 +555,32 @@ class Database:
             )
             return result.all()
 
-    async def action_range(self, start_event: int, end_event: int) -> Sequence[BrowserActionRow]:
+    async def action_range(
+        self,
+        start_event: int,
+        end_event: int,
+        *,
+        actor_principal_id: str | None = None,
+    ) -> Sequence[BrowserActionRow]:
         if end_event < start_event:
             raise ValueError("end_event must be >= start_event")
         async with self.sessions() as session:
-            result = await session.scalars(
-                select(BrowserActionRow)
-                .where(BrowserActionRow.id >= start_event, BrowserActionRow.id <= end_event)
-                .order_by(BrowserActionRow.id)
+            statement = select(BrowserActionRow).where(
+                BrowserActionRow.id >= start_event,
+                BrowserActionRow.id <= end_event,
             )
+            if actor_principal_id is not None:
+                statement = statement.where(
+                    BrowserActionRow.actor_principal_id == actor_principal_id
+                )
+            result = await session.scalars(statement.order_by(BrowserActionRow.id))
             return result.all()
 
     async def create_skill_version(
         self,
         definition: WorkflowDefinition,
         *,
+        owner_principal_id: str | None = None,
         recording_id: str | None = None,
         parent_version: int | None = None,
         change_reason: str = "created",
@@ -346,9 +593,15 @@ class Database:
             if skill is None:
                 if expected_current_version not in (None, 0):
                     raise ValueError("workflow no longer exists at the expected version")
-                skill = SkillRow(name=definition.name, description=definition.description)
+                skill = SkillRow(
+                    name=definition.name,
+                    description=definition.description,
+                    owner_principal_id=owner_principal_id,
+                )
                 session.add(skill)
                 await session.flush()
+            elif skill.owner_principal_id is None and owner_principal_id is not None:
+                skill.owner_principal_id = owner_principal_id
             if (
                 expected_current_version is not None
                 and skill.current_version != expected_current_version
@@ -438,6 +691,7 @@ class Database:
         inputs: dict[str, Any],
         status: str = "running",
         idempotency_key: str | None = None,
+        requested_by_principal_id: str | None = None,
     ) -> RunRow:
         async with self.sessions() as session:
             if idempotency_key is not None:
@@ -450,6 +704,7 @@ class Database:
                 if existing is not None:
                     return existing
             row = RunRow(
+                requested_by_principal_id=requested_by_principal_id,
                 skill_id=skill.id,
                 workflow_version_id=version.id,
                 workflow_version=version.version,
@@ -817,6 +1072,7 @@ class Database:
         self,
         event_type: str,
         *,
+        principal_id: str | None = None,
         entity_type: str | None = None,
         entity_id: str | None = None,
         data: dict[str, Any] | None = None,
@@ -824,6 +1080,7 @@ class Database:
         async with self.sessions.begin() as session:
             session.add(
                 AuditEventRow(
+                    principal_id=principal_id,
                     event_type=event_type,
                     entity_type=entity_type,
                     entity_id=entity_id,

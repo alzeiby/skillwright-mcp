@@ -5,6 +5,7 @@ from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
+from .auth import AuthorizationError, AuthorizationService
 from .browser import BrowserActionResult, BrowserController
 from .db import Database, RepairRow, RunRow, SkillRow, WorkflowVersionRow
 from .snapshot import PageSnapshot, SnapshotElement, parse_snapshot
@@ -24,9 +25,15 @@ from .workflow import (
 
 
 class WorkflowEngine:
-    def __init__(self, database: Database, browser: BrowserController) -> None:
+    def __init__(
+        self,
+        database: Database,
+        browser: BrowserController,
+        authorization: AuthorizationService | None = None,
+    ) -> None:
         self.database = database
         self.browser = browser
+        self.authorization = authorization
 
     async def run_skill(
         self,
@@ -35,12 +42,14 @@ class WorkflowEngine:
         inputs: dict[str, Any] | None = None,
         version: int | None = None,
         idempotency_key: str | None = None,
+        requested_by_principal_id: str | None = None,
     ) -> dict[str, Any]:
         prepared = await self.prepare_run(
             name,
             inputs=inputs,
             version=version,
             idempotency_key=idempotency_key,
+            requested_by_principal_id=requested_by_principal_id,
         )
         if prepared["status"] != "queued":
             return prepared
@@ -56,6 +65,7 @@ class WorkflowEngine:
         inputs: dict[str, Any] | None = None,
         version: int | None = None,
         idempotency_key: str | None = None,
+        requested_by_principal_id: str | None = None,
     ) -> dict[str, Any]:
         stored = await self.database.get_workflow_version(name, version)
         if stored is None:
@@ -73,10 +83,12 @@ class WorkflowEngine:
             inputs=prepared_inputs,
             status="queued",
             idempotency_key=idempotency_key,
+            requested_by_principal_id=requested_by_principal_id,
         )
         if run.status == "queued":
             await self.database.audit(
                 "skill.run.queued",
+                principal_id=requested_by_principal_id,
                 entity_type="run",
                 entity_id=run.id,
                 data={"skill": name, "version": version_row.version},
@@ -117,6 +129,35 @@ class WorkflowEngine:
             )
             return {"status": "failed", "run_id": claimed.id, "error": "workflow version missing"}
 
+        if claimed.requested_by_principal_id is not None and self.authorization is not None:
+            try:
+                principal = await self.authorization.principal_by_id(
+                    claimed.requested_by_principal_id
+                )
+                await self.authorization.require_skill(principal, skill, "run")
+            except AuthorizationError as exc:
+                failure = {
+                    "status": "failed",
+                    "run_id": claimed.id,
+                    "reason": "permission_revoked_before_execution",
+                    "error": str(exc),
+                    "side_effect_state": "not_started",
+                }
+                await self.database.update_run(
+                    claimed.id,
+                    status="failed",
+                    failure_context=failure,
+                    finish=True,
+                )
+                await self.database.audit(
+                    "skill.run.permission_denied",
+                    principal_id=claimed.requested_by_principal_id,
+                    entity_type="run",
+                    entity_id=claimed.id,
+                    data={"skill": skill.name, "reason": str(exc)},
+                )
+                return failure
+
         definition = deepcopy(version_row.definition)
         for step_key, target in claimed.repair_overrides.items():
             index = int(step_key)
@@ -127,6 +168,7 @@ class WorkflowEngine:
         variables.update(claimed.outputs)
         await self.database.audit(
             "skill.run.started",
+            principal_id=claimed.requested_by_principal_id,
             entity_type="run",
             entity_id=claimed.id,
             data={
@@ -212,6 +254,7 @@ class WorkflowEngine:
         )
         await self.database.audit(
             "repair.requested",
+            principal_id=run.requested_by_principal_id,
             entity_type="repair",
             entity_id=repair.id,
             data={"run_id": run.id, "step": step, "candidate_id": replacement_element_id},
@@ -272,7 +315,11 @@ class WorkflowEngine:
             return result
 
         replacement_target = ElementTarget.model_validate(repair.replacement_target)
-        validation_snapshot_result = await self.browser.snapshot(source="repair", run_id=run.id)
+        validation_snapshot_result = await self.browser.snapshot(
+            source="repair",
+            run_id=run.id,
+            actor_principal_id=run.requested_by_principal_id,
+        )
         if not validation_snapshot_result.ok or validation_snapshot_result.result is None:
             result = {
                 "status": "repair_validation_failed",
@@ -381,6 +428,7 @@ class WorkflowEngine:
         )
         await self.database.audit(
             "repair.applied",
+            principal_id=run.requested_by_principal_id,
             entity_type="repair",
             entity_id=repair.id,
             data={"run_id": run.id, "status": repair_status},
@@ -453,7 +501,12 @@ class WorkflowEngine:
                 heartbeat=worker_id is not None,
             )
             started = perf_counter()
-            execution = await self._execute_step(step, variables, run.id)
+            execution = await self._execute_step(
+                step,
+                variables,
+                run.id,
+                actor_principal_id=run.requested_by_principal_id,
+            )
             duration_ms = (perf_counter() - started) * 1000
             if execution["status"] == "repair_required":
                 failure = self._repair_context(
@@ -545,6 +598,7 @@ class WorkflowEngine:
         )
         await self.database.audit(
             "skill.run.succeeded",
+            principal_id=run.requested_by_principal_id,
             entity_type="run",
             entity_id=run.id,
             data={"skill": workflow.name, "version": version_row.version},
@@ -559,11 +613,19 @@ class WorkflowEngine:
         }
 
     async def _execute_step(
-        self, step: WorkflowStep, variables: dict[str, Any], run_id: str
+        self,
+        step: WorkflowStep,
+        variables: dict[str, Any],
+        run_id: str,
+        *,
+        actor_principal_id: str | None,
     ) -> dict[str, Any]:
         if isinstance(step, NavigateStep):
             action = await self.browser.navigate(
-                render_template(step.url, variables), source="replay", run_id=run_id
+                render_template(step.url, variables),
+                source="replay",
+                run_id=run_id,
+                actor_principal_id=actor_principal_id,
             )
             return _action_outcome(action, mutating=False)
         if isinstance(step, WaitStep):
@@ -573,10 +635,15 @@ class WorkflowEngine:
                 text_gone=render_template(step.text_gone, variables) if step.text_gone else None,
                 source="replay",
                 run_id=run_id,
+                actor_principal_id=actor_principal_id,
             )
             return _action_outcome(action, mutating=False)
 
-        snapshot_action = await self.browser.snapshot(source="replay", run_id=run_id)
+        snapshot_action = await self.browser.snapshot(
+            source="replay",
+            run_id=run_id,
+            actor_principal_id=actor_principal_id,
+        )
         if not snapshot_action.ok or snapshot_action.result is None:
             return {
                 "status": "failed",
@@ -587,7 +654,12 @@ class WorkflowEngine:
 
         if isinstance(step, AssertStep):
             if step.target is not None:
-                resolved = await self._resolve_target(step.target, snapshot, run_id)
+                resolved = await self._resolve_target(
+                    step.target,
+                    snapshot,
+                    run_id,
+                    actor_principal_id=actor_principal_id,
+                )
                 if resolved is None:
                     return {
                         "status": "repair_required",
@@ -598,7 +670,12 @@ class WorkflowEngine:
                 step, snapshot, variables, resolved_target=resolved if step.target else None
             )
         if isinstance(step, ExtractStep):
-            element = await self._resolve_target(step.target, snapshot, run_id)
+            element = await self._resolve_target(
+                step.target,
+                snapshot,
+                run_id,
+                actor_principal_id=actor_principal_id,
+            )
             if element is None:
                 return {
                     "status": "repair_required",
@@ -624,7 +701,12 @@ class WorkflowEngine:
             }
 
         target = step.target
-        element = await self._resolve_target(target, snapshot, run_id)
+        element = await self._resolve_target(
+            target,
+            snapshot,
+            run_id,
+            actor_principal_id=actor_principal_id,
+        )
         if element is None:
             return {
                 "status": "repair_required",
@@ -640,6 +722,7 @@ class WorkflowEngine:
                 button=step.button,
                 source="replay",
                 run_id=run_id,
+                actor_principal_id=actor_principal_id,
             )
             outcome = _action_outcome(action, mutating=True)
         elif isinstance(step, FillStep):
@@ -650,6 +733,7 @@ class WorkflowEngine:
                 submit=step.submit,
                 source="replay",
                 run_id=run_id,
+                actor_principal_id=actor_principal_id,
             )
             outcome = _action_outcome(action, mutating=True)
         elif isinstance(step, SelectStep):
@@ -659,6 +743,7 @@ class WorkflowEngine:
                 element=target.recorded_description or element.name,
                 source="replay",
                 run_id=run_id,
+                actor_principal_id=actor_principal_id,
             )
             outcome = _action_outcome(action, mutating=True)
         else:  # pragma: no cover - discriminated union keeps this exhaustive
@@ -671,6 +756,8 @@ class WorkflowEngine:
         target: ElementTarget,
         full_snapshot: PageSnapshot,
         run_id: str,
+        *,
+        actor_principal_id: str | None,
     ) -> SnapshotElement | None:
         if target.locator:
             locator_snapshot = await self.browser.snapshot(
@@ -678,6 +765,7 @@ class WorkflowEngine:
                 depth=2,
                 source="replay",
                 run_id=run_id,
+                actor_principal_id=actor_principal_id,
             )
             if locator_snapshot.ok and locator_snapshot.result is not None:
                 targeted = parse_snapshot(locator_snapshot.result.text)

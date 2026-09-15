@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from taskiq_redis import RedisStreamBroker
 
+from .auth import AuthorizationService
 from .browser import BrowserController
 from .config import Settings
 from .db import Database
@@ -36,9 +37,10 @@ async def execute_run_task(run_id: str) -> dict[str, Any]:
     settings = Settings()
     database = Database(settings.database_url)
     await database.initialize(create_schema=False)
+    authorization = AuthorizationService(database, settings)
     playwright = PlaywrightMCPClient(settings)
     browser = BrowserController(playwright, database)
-    engine = WorkflowEngine(database, browser)
+    engine = WorkflowEngine(database, browser, authorization)
     worker_id = _worker_id()
     try:
         result = await engine.execute_persisted_run(run_id, worker_id=worker_id)
@@ -172,6 +174,7 @@ class RunDispatcher:
         inputs: dict[str, Any] | None = None,
         version: int | None = None,
         idempotency_key: str | None = None,
+        requested_by_principal_id: str | None = None,
     ) -> dict[str, Any]:
         if self.settings.execution_backend == "inline":
             return await self.engine.run_skill(
@@ -179,6 +182,7 @@ class RunDispatcher:
                 inputs=inputs,
                 version=version,
                 idempotency_key=idempotency_key,
+                requested_by_principal_id=requested_by_principal_id,
             )
 
         prepared = await self.engine.prepare_run(
@@ -186,6 +190,7 @@ class RunDispatcher:
             inputs=inputs,
             version=version,
             idempotency_key=idempotency_key,
+            requested_by_principal_id=requested_by_principal_id,
         )
         if prepared["status"] != "queued":
             return prepared

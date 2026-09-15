@@ -18,30 +18,47 @@ class SkillService:
         self.browser = browser
         self.engine = engine
 
-    async def record_start(self, name: str, description: str = "") -> dict[str, Any]:
-        if self.browser.active_recording_id is not None:
+    async def record_start(
+        self,
+        name: str,
+        description: str = "",
+        *,
+        owner_principal_id: str | None = None,
+    ) -> dict[str, Any]:
+        active_recording_id = self.browser.active_recording_for(owner_principal_id)
+        if active_recording_id is not None:
             return {
                 "status": "already_recording",
-                "recording_id": self.browser.active_recording_id,
+                "recording_id": active_recording_id,
             }
-        row = await self.database.start_recording(name=name, description=description)
-        self.browser.active_recording_id = row.id
+        row = await self.database.start_recording(
+            name=name,
+            description=description,
+            owner_principal_id=owner_principal_id,
+        )
+        self.browser.set_active_recording(owner_principal_id, row.id)
         await self.database.audit(
             "skill.recording.started",
+            principal_id=owner_principal_id,
             entity_type="recording",
             entity_id=row.id,
             data={"name": name},
         )
         return {"status": "recording", "recording_id": row.id, "name": name}
 
-    async def record_stop(self) -> dict[str, Any]:
-        recording_id = self.browser.active_recording_id
+    async def record_stop(self, *, owner_principal_id: str | None = None) -> dict[str, Any]:
+        recording_id = self.browser.active_recording_for(owner_principal_id)
         if recording_id is None:
             return {"status": "not_recording"}
-        self.browser.active_recording_id = None
+        self.browser.set_active_recording(owner_principal_id, None)
         recording = await self.database.get_recording(recording_id)
         if recording is None:
             return {"status": "error", "error": "active recording disappeared"}
+        if (
+            owner_principal_id is not None
+            and recording.owner_principal_id != owner_principal_id
+        ):
+            return {"status": "forbidden", "error": "recording belongs to another principal"}
         actions = await self.database.recording_actions(recording_id)
         try:
             workflow = compile_actions(
@@ -58,12 +75,14 @@ class SkillService:
             }
         skill, version = await self.database.create_skill_version(
             workflow,
+            owner_principal_id=owner_principal_id,
             recording_id=recording_id,
             change_reason="recording",
         )
         await self.database.stop_recording(recording_id, status="compiled")
         await self.database.audit(
             "skill.version.created",
+            principal_id=owner_principal_id,
             entity_type="skill",
             entity_id=skill.id,
             data={"name": skill.name, "version": version.version, "recording_id": recording_id},
@@ -84,8 +103,13 @@ class SkillService:
         start_event: int,
         end_event: int,
         description: str = "",
+        owner_principal_id: str | None = None,
     ) -> dict[str, Any]:
-        actions = await self.database.action_range(start_event, end_event)
+        actions = await self.database.action_range(
+            start_event,
+            end_event,
+            actor_principal_id=owner_principal_id,
+        )
         if not actions:
             return {"status": "not_found", "error": "no browser actions in requested range"}
         try:
@@ -94,6 +118,7 @@ class SkillService:
             return {"status": "compile_failed", "error": str(exc)}
         skill, version = await self.database.create_skill_version(
             workflow,
+            owner_principal_id=owner_principal_id,
             change_reason=f"history events {start_event}-{end_event}",
         )
         return {

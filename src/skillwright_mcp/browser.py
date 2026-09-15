@@ -35,11 +35,46 @@ class BrowserController:
     def __init__(self, playwright: PlaywrightMCPClient, database: Database) -> None:
         self.playwright = playwright
         self.database = database
-        self.active_recording_id: str | None = None
+        self._active_recordings: dict[str, str] = {}
         self.latest_snapshot: str | None = None
 
+    @staticmethod
+    def _actor_key(actor_principal_id: str | None) -> str:
+        return actor_principal_id or "__legacy__"
+
+    @property
+    def active_recording_id(self) -> str | None:
+        return self._active_recordings.get(self._actor_key(None))
+
+    @active_recording_id.setter
+    def active_recording_id(self, value: str | None) -> None:
+        key = self._actor_key(None)
+        if value is None:
+            self._active_recordings.pop(key, None)
+        else:
+            self._active_recordings[key] = value
+
+    def active_recording_for(self, actor_principal_id: str | None) -> str | None:
+        return self._active_recordings.get(self._actor_key(actor_principal_id))
+
+    def set_active_recording(
+        self,
+        actor_principal_id: str | None,
+        recording_id: str | None,
+    ) -> None:
+        key = self._actor_key(actor_principal_id)
+        if recording_id is None:
+            self._active_recordings.pop(key, None)
+        else:
+            self._active_recordings[key] = recording_id
+
     async def navigate(
-        self, url: str, *, source: str = "agent", run_id: str | None = None
+        self,
+        url: str,
+        *,
+        source: str = "agent",
+        run_id: str | None = None,
+        actor_principal_id: str | None = None,
     ) -> BrowserActionResult:
         return await self._call(
             public_name="browser_navigate",
@@ -48,6 +83,7 @@ class BrowserController:
             upstream_args={"url": url},
             source=source,
             run_id=run_id,
+            actor_principal_id=actor_principal_id,
         )
 
     async def snapshot(
@@ -57,6 +93,7 @@ class BrowserController:
         depth: int | None = None,
         source: str = "agent",
         run_id: str | None = None,
+        actor_principal_id: str | None = None,
     ) -> BrowserActionResult:
         args: dict[str, Any] = {}
         if target is not None:
@@ -70,6 +107,7 @@ class BrowserController:
             upstream_args=args,
             source=source,
             run_id=run_id,
+            actor_principal_id=actor_principal_id,
         )
 
     async def click(
@@ -81,6 +119,7 @@ class BrowserController:
         button: Literal["left", "right", "middle"] = "left",
         source: str = "agent",
         run_id: str | None = None,
+        actor_principal_id: str | None = None,
     ) -> BrowserActionResult:
         public_args: dict[str, Any] = {
             "target": target,
@@ -102,6 +141,7 @@ class BrowserController:
             upstream_args=upstream_args,
             source=source,
             run_id=run_id,
+            actor_principal_id=actor_principal_id,
         )
 
     async def fill(
@@ -113,6 +153,7 @@ class BrowserController:
         submit: bool = False,
         source: str = "agent",
         run_id: str | None = None,
+        actor_principal_id: str | None = None,
     ) -> BrowserActionResult:
         public_args: dict[str, Any] = {
             "target": target,
@@ -132,6 +173,7 @@ class BrowserController:
             upstream_args=upstream_args,
             source=source,
             run_id=run_id,
+            actor_principal_id=actor_principal_id,
         )
 
     async def select(
@@ -142,6 +184,7 @@ class BrowserController:
         element: str | None = None,
         source: str = "agent",
         run_id: str | None = None,
+        actor_principal_id: str | None = None,
     ) -> BrowserActionResult:
         public_args = {"target": target, "values": values, "element": element}
         upstream_args: dict[str, Any] = {"target": target, "values": values}
@@ -154,6 +197,7 @@ class BrowserController:
             upstream_args=upstream_args,
             source=source,
             run_id=run_id,
+            actor_principal_id=actor_principal_id,
         )
 
     async def wait(
@@ -164,6 +208,7 @@ class BrowserController:
         text_gone: str | None = None,
         source: str = "agent",
         run_id: str | None = None,
+        actor_principal_id: str | None = None,
     ) -> BrowserActionResult:
         args: dict[str, Any] = {}
         if seconds is not None:
@@ -180,6 +225,7 @@ class BrowserController:
             upstream_args=args,
             source=source,
             run_id=run_id,
+            actor_principal_id=actor_principal_id,
         )
 
     async def generate_locator(self, target: str, *, element: str | None = None) -> str | None:
@@ -197,6 +243,7 @@ class BrowserController:
         upstream_args: dict[str, Any],
         source: str,
         run_id: str | None,
+        actor_principal_id: str | None,
     ) -> BrowserActionResult:
         snapshot_before = self.latest_snapshot
         durable_locator = (
@@ -204,8 +251,11 @@ class BrowserController:
             if public_name in {"browser_click", "browser_fill", "browser_select"}
             else None
         )
-        recording_id = self.active_recording_id if source == "agent" else None
+        recording_id = (
+            self.active_recording_for(actor_principal_id) if source == "agent" else None
+        )
         pending = await self.database.start_browser_action(
+            actor_principal_id=actor_principal_id,
             recording_id=recording_id,
             run_id=run_id,
             source=source,
