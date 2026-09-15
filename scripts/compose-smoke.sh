@@ -115,5 +115,12 @@ migrate_id="$(docker compose --profile app ps -a -q migrate)"
 schema_version="$(docker compose --profile app exec -T postgres \
     psql -U skillwright -d skillwright -Atc 'select version_num from alembic_version')"
 [ -n "$schema_version" ]
+expected_schema_version="$(sed -n 's/^SCHEMA_REVISION = "\([^"]*\)"/\1/p' \
+    src/skillwright_mcp/db.py)"
+[ -n "$expected_schema_version" ]
+if [ "$schema_version" != "$expected_schema_version" ]; then
+    printf 'Expected Alembic schema %s, found %s.\n' "$expected_schema_version" "$schema_version" >&2
+    exit 1
+fi
 
 printf 'Compose smoke passed with authenticated MCP (schema %s).\n' "$schema_version"

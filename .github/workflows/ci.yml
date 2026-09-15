@@ -76,7 +76,10 @@ jobs:
     env:
       SKILLWRIGHT_DATABASE_URL: postgresql+asyncpg://skillwright:skillwright@127.0.0.1:5432/skillwright
       SKILLWRIGHT_REDIS_URL: redis://127.0.0.1:6379/0
+      SKILLWRIGHT_REDIS_QUEUE_NAME: skillwright-ci-runs
+      SKILLWRIGHT_WORKER_CONCURRENCY: "2"
       SKILLWRIGHT_INTEGRATION_SERVICES: "1"
+      SKILLWRIGHT_PLAYWRIGHT_COMMAND: ${{ github.workspace }}/scripts/playwright-mcp-offline.sh
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -113,12 +116,54 @@ jobs:
           uv run alembic downgrade a6f585d77dc1
           uv run alembic upgrade head
           uv run alembic check
+      - name: Start real Taskiq worker
+        run: |
+          uv run taskiq worker \
+            skillwright_mcp.queue:broker \
+            --workers 1 \
+            --max-async-tasks "$SKILLWRIGHT_WORKER_CONCURRENCY" \
+            --ack-type when_executed \
+            > /tmp/skillwright-taskiq-worker.log 2>&1 &
+          echo "$!" > /tmp/skillwright-taskiq-worker.pid
+          sleep 2
+          kill -0 "$(cat /tmp/skillwright-taskiq-worker.pid)"
       - run: uv run pytest -q tests/test_services_integration.py
+      - name: Verify Taskiq worker stayed healthy
+        run: |
+          kill -0 "$(cat /tmp/skillwright-taskiq-worker.pid)"
+          if grep -Eq 'Exception found while executing function|Traceback \(most recent call last\)|Attempted to exit cancel scope in a different task' /tmp/skillwright-taskiq-worker.log; then
+            cat /tmp/skillwright-taskiq-worker.log
+            exit 1
+          fi
+      - name: Stop Taskiq worker and verify clean teardown
+        run: |
+          pid="$(cat /tmp/skillwright-taskiq-worker.pid)"
+          kill "$pid"
+          for _ in $(seq 1 60); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+          if kill -0 "$pid" 2>/dev/null; then
+            echo "Taskiq worker did not stop within 15 seconds"
+            cat /tmp/skillwright-taskiq-worker.log
+            kill -KILL "$pid" || true
+            exit 1
+          fi
+          if grep -Eq 'Exception found while executing function|Traceback \(most recent call last\)|Attempted to exit cancel scope in a different task' /tmp/skillwright-taskiq-worker.log; then
+            cat /tmp/skillwright-taskiq-worker.log
+            exit 1
+          fi
       - name: Run real browser integration
-        env:
-          SKILLWRIGHT_PLAYWRIGHT_COMMAND: ${{ github.workspace }}/scripts/playwright-mcp-offline.sh
-          SKILLWRIGHT_PLAYWRIGHT_PACKAGE: "@playwright/mcp@0.0.81"
         run: uv run pytest -q tests/test_integration_browser.py
+      - if: failure()
+        run: cat /tmp/skillwright-taskiq-worker.log || true
+      - if: always()
+        run: |
+          if [ -f /tmp/skillwright-taskiq-worker.pid ]; then
+            kill "$(cat /tmp/skillwright-taskiq-worker.pid)" || true
+          fi
 
   image:
     runs-on: ubuntu-latest
