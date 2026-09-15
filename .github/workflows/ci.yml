@@ -101,8 +101,11 @@ jobs:
           test -x "$browser_path"
           mcp_binary="$(command -v playwright-mcp)"
           test -x "$mcp_binary"
-          echo "SKILLWRIGHT_PLAYWRIGHT_EXECUTABLE=$browser_path" >> "$GITHUB_ENV"
-          echo "SKILLWRIGHT_PLAYWRIGHT_MCP_BINARY=$mcp_binary" >> "$GITHUB_ENV"
+          # The MCP SDK intentionally forwards only a narrow environment allowlist to stdio
+          # children, so do not depend on Skillwright-specific env vars reaching this wrapper.
+          # Mirror the production image's fixed offline paths instead.
+          sudo ln -sf "$browser_path" /usr/local/bin/skillwright-chromium
+          sudo ln -sf "$mcp_binary" /usr/local/bin/playwright-mcp
           chmod +x scripts/playwright-mcp-offline.sh
       - name: Validate migrations forward and backward
         run: |
