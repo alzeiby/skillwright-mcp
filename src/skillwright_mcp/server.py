@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from mcp.server import MCPServer
 from mcp.server.auth.middleware.auth_context import get_access_token
@@ -17,10 +17,12 @@ from .auth import (
     Role,
     SkillPermission,
 )
+from .browser import BrowserController
 from .config import Settings
 from .db import PrincipalRow, RunRow, SkillRow
 from .runtime import Runtime, runtime_lifespan
 from .secrets import SecretResolutionError, validate_secret_ref
+from .skills import SkillService
 from .workflow import ParameterBinding
 
 AppContext = Runtime
@@ -71,6 +73,40 @@ mcp = MCPServer(
 
 def _app(ctx: Context[AppContext]) -> AppContext:
     return ctx.request_context.lifespan_context
+
+
+def _transport_session_id(ctx: Context[AppContext]) -> str | None:
+    """Return the server-issued MCP transport session id when this SDK exposes one."""
+
+    session_id = getattr(ctx, "session_id", None)
+    if isinstance(session_id, str) and session_id:
+        return session_id
+
+    # MCPServer's compatibility Context does not yet forward Context.session_id from the
+    # newer server API. Its ServerSession still owns the same SDK Connection, whose
+    # server-issued id is populated for stateful Streamable HTTP and absent on stdio/stateless.
+    session = cast(Any, ctx.session)
+    connection = getattr(session, "_connection", None)
+    session_id = getattr(connection, "session_id", None)
+    return session_id if isinstance(session_id, str) and session_id else None
+
+
+def _browser_session_key(ctx: Context[AppContext], principal: PrincipalRow) -> str:
+    session_id = _transport_session_id(ctx)
+    if session_id is not None:
+        return f"principal:{principal.id}:session:{session_id}"
+    # Stdio and stateless HTTP have no transport session id. Principal ownership is the
+    # stable security boundary there; local stdio resolves to its configured local principal.
+    return f"principal:{principal.id}:fallback"
+
+
+@asynccontextmanager
+async def _browser_session(
+    ctx: Context[AppContext], principal: PrincipalRow
+) -> AsyncIterator[BrowserController]:
+    app = _app(ctx)
+    async with app.interactive_browsers.use(_browser_session_key(ctx, principal)) as browser:
+        yield browser
 
 
 async def _principal(ctx: Context[AppContext]) -> PrincipalRow:
@@ -126,9 +162,8 @@ async def browser_navigate(url: str, ctx: Context[AppContext]) -> dict[str, Any]
     app = _app(ctx)
     principal = await _principal(ctx)
     app.authorization.require_global(principal, "browser")
-    return (
-        await app.browser.navigate(url, actor_principal_id=principal.id)
-    ).as_dict()
+    async with _browser_session(ctx, principal) as browser:
+        return (await browser.navigate(url, actor_principal_id=principal.id)).as_dict()
 
 
 @mcp.tool()
@@ -142,13 +177,14 @@ async def browser_snapshot(
     app = _app(ctx)
     principal = await _principal(ctx)
     app.authorization.require_global(principal, "browser")
-    return (
-        await app.browser.snapshot(
-            target=target,
-            depth=depth,
-            actor_principal_id=principal.id,
-        )
-    ).as_dict()
+    async with _browser_session(ctx, principal) as browser:
+        return (
+            await browser.snapshot(
+                target=target,
+                depth=depth,
+                actor_principal_id=principal.id,
+            )
+        ).as_dict()
 
 
 @mcp.tool()
@@ -164,15 +200,16 @@ async def browser_click(
     app = _app(ctx)
     principal = await _principal(ctx)
     app.authorization.require_global(principal, "browser")
-    return (
-        await app.browser.click(
-            target,
-            element=element,
-            double_click=double_click,
-            button=button,
-            actor_principal_id=principal.id,
-        )
-    ).as_dict()
+    async with _browser_session(ctx, principal) as browser:
+        return (
+            await browser.click(
+                target,
+                element=element,
+                double_click=double_click,
+                button=button,
+                actor_principal_id=principal.id,
+            )
+        ).as_dict()
 
 
 @mcp.tool()
@@ -188,15 +225,16 @@ async def browser_fill(
     app = _app(ctx)
     principal = await _principal(ctx)
     app.authorization.require_global(principal, "browser")
-    return (
-        await app.browser.fill(
-            target,
-            text,
-            element=element,
-            submit=submit,
-            actor_principal_id=principal.id,
-        )
-    ).as_dict()
+    async with _browser_session(ctx, principal) as browser:
+        return (
+            await browser.fill(
+                target,
+                text,
+                element=element,
+                submit=submit,
+                actor_principal_id=principal.id,
+            )
+        ).as_dict()
 
 
 @mcp.tool()
@@ -218,17 +256,18 @@ async def browser_fill_secret(
         secret_value = app.engine.secret_resolver.resolve(normalized_ref)
     except (ValueError, SecretResolutionError) as exc:
         return {"ok": False, "error": str(exc)}
-    return (
-        await app.browser.fill_secret(
-            target,
-            secret_value,
-            secret_ref=normalized_ref,
-            input_name=input_name,
-            element=element,
-            submit=submit,
-            actor_principal_id=principal.id,
-        )
-    ).as_dict()
+    async with _browser_session(ctx, principal) as browser:
+        return (
+            await browser.fill_secret(
+                target,
+                secret_value,
+                secret_ref=normalized_ref,
+                input_name=input_name,
+                element=element,
+                submit=submit,
+                actor_principal_id=principal.id,
+            )
+        ).as_dict()
 
 
 @mcp.tool()
@@ -243,14 +282,15 @@ async def browser_select(
     app = _app(ctx)
     principal = await _principal(ctx)
     app.authorization.require_global(principal, "browser")
-    return (
-        await app.browser.select(
-            target,
-            values,
-            element=element,
-            actor_principal_id=principal.id,
-        )
-    ).as_dict()
+    async with _browser_session(ctx, principal) as browser:
+        return (
+            await browser.select(
+                target,
+                values,
+                element=element,
+                actor_principal_id=principal.id,
+            )
+        ).as_dict()
 
 
 @mcp.tool()
@@ -267,14 +307,15 @@ async def browser_wait(
     app = _app(ctx)
     principal = await _principal(ctx)
     app.authorization.require_global(principal, "browser")
-    return (
-        await app.browser.wait(
-            seconds=seconds,
-            text=text,
-            text_gone=text_gone,
-            actor_principal_id=principal.id,
-        )
-    ).as_dict()
+    async with _browser_session(ctx, principal) as browser:
+        return (
+            await browser.wait(
+                seconds=seconds,
+                text=text,
+                text_gone=text_gone,
+                actor_principal_id=principal.id,
+            )
+        ).as_dict()
 
 
 @mcp.tool()
@@ -288,11 +329,13 @@ async def skill_record_start(
     app = _app(ctx)
     principal = await _principal(ctx)
     app.authorization.require_global(principal, "create_skill")
-    return await app.skills.record_start(
-        name,
-        description,
-        owner_principal_id=principal.id,
-    )
+    async with _browser_session(ctx, principal) as browser:
+        skills = SkillService(app.database, browser, app.engine)
+        return await skills.record_start(
+            name,
+            description,
+            owner_principal_id=principal.id,
+        )
 
 
 @mcp.tool()
@@ -302,7 +345,9 @@ async def skill_record_stop(ctx: Context[AppContext]) -> dict[str, Any]:
     app = _app(ctx)
     principal = await _principal(ctx)
     app.authorization.require_global(principal, "create_skill")
-    return await app.skills.record_stop(owner_principal_id=principal.id)
+    async with _browser_session(ctx, principal) as browser:
+        skills = SkillService(app.database, browser, app.engine)
+        return await skills.record_stop(owner_principal_id=principal.id)
 
 
 @mcp.tool()

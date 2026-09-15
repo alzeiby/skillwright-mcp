@@ -79,6 +79,7 @@ class BrowserController:
         finally:
             self._session_redactor = Redactor()
             self.latest_snapshot = None
+            self._active_recordings.clear()
 
     async def navigate(
         self,

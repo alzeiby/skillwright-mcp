@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
+import hashlib
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass, field
+from time import monotonic
 
 from redis.asyncio import Redis
 from sqlalchemy import select
@@ -17,6 +19,119 @@ from .playwright import PlaywrightMCPClient
 from .queue import RunDispatcher
 from .skills import SkillService
 
+INTERACTIVE_BROWSER_IDLE_TIMEOUT_SECONDS = 30 * 60.0
+_INTERACTIVE_BROWSER_CLEANUP_INTERVAL_SECONDS = 60.0
+
+
+@dataclass(slots=True)
+class _BrowserSessionEntry:
+    browser: BrowserController
+    last_used: float
+    leases: int = 0
+    operation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+class BrowserSessionPool:
+    """Own one interactive Playwright subprocess per MCP session/fallback key.
+
+    The MCP SDK expires idle Streamable HTTP sessions after 30 minutes by default but does
+    not currently expose an application teardown callback. This pool mirrors that bound with
+    its own sweeper, so an abandoned transport cannot retain a Playwright subprocess or secret
+    redaction state indefinitely. Runtime shutdown closes every remaining entry explicitly.
+    """
+
+    def __init__(
+        self,
+        browser_factory: Callable[[str], BrowserController],
+        *,
+        idle_timeout_seconds: float = INTERACTIVE_BROWSER_IDLE_TIMEOUT_SECONDS,
+        cleanup_interval_seconds: float = _INTERACTIVE_BROWSER_CLEANUP_INTERVAL_SECONDS,
+        clock: Callable[[], float] = monotonic,
+    ) -> None:
+        if idle_timeout_seconds <= 0:
+            raise ValueError("idle_timeout_seconds must be positive")
+        if cleanup_interval_seconds <= 0:
+            raise ValueError("cleanup_interval_seconds must be positive")
+        self._browser_factory = browser_factory
+        self._idle_timeout_seconds = idle_timeout_seconds
+        self._cleanup_interval_seconds = min(cleanup_interval_seconds, idle_timeout_seconds)
+        self._clock = clock
+        self._entries: dict[str, _BrowserSessionEntry] = {}
+        self._lock = asyncio.Lock()
+        self._cleanup_task: asyncio.Task[None] | None = None
+        self._closed = False
+
+    def start(self) -> None:
+        if self._closed:
+            raise RuntimeError("browser session pool is closed")
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(
+                self._cleanup_loop(),
+                name="skillwright-browser-session-cleanup",
+            )
+
+    @asynccontextmanager
+    async def use(self, key: str) -> AsyncIterator[BrowserController]:
+        """Lease the browser owned by one MCP session or authenticated fallback key."""
+
+        self.start()
+        async with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = _BrowserSessionEntry(
+                    browser=self._browser_factory(key),
+                    last_used=self._clock(),
+                )
+                self._entries[key] = entry
+            entry.leases += 1
+            entry.last_used = self._clock()
+        acquired = False
+        try:
+            await entry.operation_lock.acquire()
+            acquired = True
+            yield entry.browser
+        finally:
+            if acquired:
+                entry.operation_lock.release()
+            async with self._lock:
+                current = self._entries.get(key)
+                if current is entry:
+                    current.leases -= 1
+                    current.last_used = self._clock()
+
+    async def cleanup_idle(self) -> None:
+        """Close unleased session browsers that exceeded the bounded idle lifetime."""
+
+        cutoff = self._clock() - self._idle_timeout_seconds
+        stale: list[BrowserController] = []
+        async with self._lock:
+            for key, entry in list(self._entries.items()):
+                if entry.leases == 0 and entry.last_used <= cutoff:
+                    stale.append(entry.browser)
+                    del self._entries[key]
+        if stale:
+            await asyncio.gather(*(browser.close() for browser in stale), return_exceptions=True)
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        cleanup_task, self._cleanup_task = self._cleanup_task, None
+        if cleanup_task is not None:
+            cleanup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await cleanup_task
+        async with self._lock:
+            browsers = [entry.browser for entry in self._entries.values()]
+            self._entries.clear()
+        if browsers:
+            await asyncio.gather(*(browser.close() for browser in browsers), return_exceptions=True)
+
+    async def _cleanup_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._cleanup_interval_seconds)
+            await self.cleanup_idle()
+
 
 @dataclass(slots=True)
 class Runtime:
@@ -29,6 +144,7 @@ class Runtime:
     dispatcher: RunDispatcher
     authorization: AuthorizationService
     bearer_auth: BearerTokenAuthenticator
+    interactive_browsers: BrowserSessionPool
     _database_initialized: bool = False
     _local_principal_initialized: bool = False
 
@@ -50,10 +166,12 @@ class Runtime:
         if self.settings.allow_unauthenticated_local and not self._local_principal_initialized:
             await self.authorization.local_principal()
             self._local_principal_initialized = True
+        self.interactive_browsers.start()
         await self.dispatcher.start()
 
     async def close(self) -> None:
         await self.dispatcher.close()
+        await self.interactive_browsers.close()
         await self.browser.close()
         await self.database.close()
 
@@ -108,6 +226,9 @@ def build_runtime(settings: Settings | None = None) -> Runtime:
     engine = WorkflowEngine(database, browser, authorization)
     skills = SkillService(database, browser, engine)
     dispatcher = RunDispatcher(settings=resolved, database=database, engine=engine)
+    interactive_browsers = BrowserSessionPool(
+        lambda key: _build_interactive_browser(resolved, database, key)
+    )
     return Runtime(
         settings=resolved,
         database=database,
@@ -118,7 +239,27 @@ def build_runtime(settings: Settings | None = None) -> Runtime:
         dispatcher=dispatcher,
         authorization=authorization,
         bearer_auth=bearer_auth,
+        interactive_browsers=interactive_browsers,
     )
+
+
+def _build_interactive_browser(
+    settings: Settings,
+    database: Database,
+    session_key: str,
+) -> BrowserController:
+    # Playwright MCP can write downloads and other automatically named artifacts to its
+    # output directory. Give each interactive session a separate, non-identifying path so
+    # subprocesses cannot collide on or reference another session's artifacts.
+    directory_key = hashlib.sha256(session_key.encode("utf-8")).hexdigest()
+    session_settings = settings.model_copy(
+        update={
+            "playwright_output_dir": settings.playwright_output_dir
+            / "interactive-sessions"
+            / directory_key
+        }
+    )
+    return BrowserController(PlaywrightMCPClient(session_settings), database)
 
 
 @asynccontextmanager
