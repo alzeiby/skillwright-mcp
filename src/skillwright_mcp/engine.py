@@ -272,6 +272,7 @@ class WorkflowEngine:
         step: int,
         replacement_element_id: str,
         persist: bool = True,
+        actor_principal_id: str | None = None,
     ) -> dict[str, Any]:
         run = await self.database.get_run(run_id)
         if run is None:
@@ -330,7 +331,7 @@ class WorkflowEngine:
         )
         await self.database.audit(
             "repair.requested",
-            principal_id=run.requested_by_principal_id,
+            principal_id=actor_principal_id or run.requested_by_principal_id,
             entity_type="repair",
             entity_id=repair.id,
             data={"run_id": run.id, "step": step, "candidate_id": replacement_element_id},
@@ -541,12 +542,14 @@ class WorkflowEngine:
         step: int,
         replacement_element_id: str,
         persist: bool = True,
+        actor_principal_id: str | None = None,
     ) -> dict[str, Any]:
         requested = await self.request_repair(
             run_id,
             step=step,
             replacement_element_id=replacement_element_id,
             persist=persist,
+            actor_principal_id=actor_principal_id,
         )
         if requested.get("status") != "repair_pending":
             return requested

@@ -16,6 +16,7 @@ from skillwright_mcp.browser import BrowserController
 from skillwright_mcp.config import Settings
 from skillwright_mcp.db import BrowserActionRow, Database
 from skillwright_mcp.engine import WorkflowEngine
+from skillwright_mcp.runtime import build_runtime
 from skillwright_mcp.workflow import WorkflowDefinition
 
 
@@ -49,6 +50,54 @@ async def test_hashed_bearer_authenticator_and_mcp_verifier_do_not_retain_token(
         "iss": "https://auth.example.test",
         "skillwright_external_key": "service@example.test",
     }
+
+
+def test_hashed_bearer_authenticator_rejects_case_variant_duplicate_digest() -> None:
+    digest = "ab" * 32
+    with pytest.raises(ValueError, match="unique"):
+        BearerTokenAuthenticator(
+            {
+                digest: "first@example.test",
+                digest.upper(): "second@example.test",
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_admin_is_created_once_without_repromoting_existing_principal(
+    tmp_path: Any,
+) -> None:
+    database_url = f"sqlite+aiosqlite:///{(tmp_path / 'bootstrap-auth.db').as_posix()}"
+    settings = Settings(
+        database_url=database_url,
+        database_auto_create_schema=True,
+        execution_backend="inline",
+        allow_unauthenticated_local=False,
+        bootstrap_admin_principal="bootstrap@example.test",
+    )
+    runtime = build_runtime(settings)
+    try:
+        await runtime.start()
+        created = await runtime.database.get_principal_by_external_key("bootstrap@example.test")
+        assert created is not None
+        assert created.role == "admin"
+    finally:
+        await runtime.close()
+
+    database = Database(database_url)
+    try:
+        await database.set_principal_role("bootstrap@example.test", "viewer")
+    finally:
+        await database.close()
+
+    runtime = build_runtime(settings)
+    try:
+        await runtime.start()
+        existing = await runtime.database.get_principal_by_external_key("bootstrap@example.test")
+        assert existing is not None
+        assert existing.role == "viewer"
+    finally:
+        await runtime.close()
 
 
 async def _setup(tmp_path: Any) -> tuple[Database, AuthorizationService]:

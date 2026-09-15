@@ -71,6 +71,15 @@ class BrowserController:
         else:
             self._active_recordings[key] = recording_id
 
+    async def close(self) -> None:
+        """Close the browser session and release secret material retained for session redaction."""
+
+        try:
+            await self.playwright.close()
+        finally:
+            self._session_redactor = Redactor()
+            self.latest_snapshot = None
+
     async def navigate(
         self,
         url: str,
@@ -338,6 +347,8 @@ class BrowserController:
         with tracer().start_as_current_span(
             "browser.action",
             attributes=span_attributes,
+            record_exception=False,
+            set_status_on_exception=False,
         ) as span:
             started = perf_counter()
             result: BrowserResult | None = None

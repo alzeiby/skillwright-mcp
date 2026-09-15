@@ -38,6 +38,15 @@ class Runtime:
                 create_schema=self.settings.database_auto_create_schema,
             )
             self._database_initialized = True
+        if self.settings.bootstrap_admin_principal:
+            existing = await self.database.get_principal_by_external_key(
+                self.settings.bootstrap_admin_principal
+            )
+            if existing is None:
+                await self.database.ensure_principal(
+                    self.settings.bootstrap_admin_principal,
+                    "admin",
+                )
         if self.settings.allow_unauthenticated_local and not self._local_principal_initialized:
             await self.authorization.local_principal()
             self._local_principal_initialized = True
@@ -45,7 +54,7 @@ class Runtime:
 
     async def close(self) -> None:
         await self.dispatcher.close()
-        await self.playwright.close()
+        await self.browser.close()
         await self.database.close()
 
     async def readiness(self) -> dict[str, str]:

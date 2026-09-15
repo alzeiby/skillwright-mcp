@@ -30,12 +30,17 @@ class BearerTokenAuthenticator:
 
     def __init__(self, token_hashes: dict[str, str]) -> None:
         normalized: list[tuple[str, str]] = []
+        seen_hashes: set[str] = set()
         for token_hash, principal_key in token_hashes.items():
             if _SHA256_HEX_RE.fullmatch(token_hash) is None:
                 raise ValueError("auth token hashes must be 64-character SHA-256 hex digests")
             if not principal_key.strip():
                 raise ValueError("auth token principal keys must be non-empty")
-            normalized.append((token_hash.lower(), principal_key))
+            normalized_hash = token_hash.lower()
+            if normalized_hash in seen_hashes:
+                raise ValueError("auth token hashes must be unique")
+            seen_hashes.add(normalized_hash)
+            normalized.append((normalized_hash, principal_key))
         self._token_hashes = tuple(normalized)
 
     @property

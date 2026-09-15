@@ -514,12 +514,13 @@ async def skill_repair(
 ) -> dict[str, Any]:
     """Apply one candidate target repair, continue the run, and optionally save a new version."""
 
-    await _run(ctx, run_id, "edit")
+    principal, _, _ = await _run(ctx, run_id, "edit")
     return await _app(ctx).dispatcher.repair(
         run_id,
         step=step,
         replacement_element_id=replacement_element_id,
         persist=persist,
+        actor_principal_id=principal.id,
     )
 
 

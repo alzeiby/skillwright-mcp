@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     allow_unauthenticated_local: bool = True
     local_principal: str = "local"
     local_role: Literal["admin", "developer", "viewer"] = "admin"
+    bootstrap_admin_principal: str | None = None
     auth_token_hashes: dict[str, str] = Field(default_factory=dict)
     auth_issuer_url: str = "https://skillwright.local"
     mcp_resource_server_url: str | None = None
@@ -34,7 +35,6 @@ class Settings(BaseSettings):
     api_port: int = Field(default=8767, ge=1, le=65_535)
     healthcheck_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
     worker_concurrency: int = Field(default=2, ge=1, le=32)
-    worker_job_timeout_seconds: int = Field(default=300, ge=10)
     repair_wait_timeout_seconds: int = Field(default=900, ge=30)
     repair_poll_interval_seconds: float = Field(default=0.5, ge=0.1, le=10)
     approval_wait_timeout_seconds: int = Field(default=900, ge=30)

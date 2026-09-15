@@ -108,7 +108,7 @@ async def execute_run(run_id: str) -> dict[str, Any]:
             "reason": "run_not_owned_by_worker",
         }
     finally:
-        await playwright.close()
+        await browser.close()
         await database.close()
 
 
@@ -387,6 +387,7 @@ class RunDispatcher:
         step: int,
         replacement_element_id: str,
         persist: bool = True,
+        actor_principal_id: str | None = None,
     ) -> dict[str, Any]:
         if self.settings.execution_backend == "inline":
             return await self.engine.repair(
@@ -394,12 +395,14 @@ class RunDispatcher:
                 step=step,
                 replacement_element_id=replacement_element_id,
                 persist=persist,
+                actor_principal_id=actor_principal_id,
             )
         return await self.engine.request_repair(
             run_id,
             step=step,
             replacement_element_id=replacement_element_id,
             persist=persist,
+            actor_principal_id=actor_principal_id,
         )
 
     async def decide_approval(

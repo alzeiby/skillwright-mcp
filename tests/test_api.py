@@ -6,9 +6,11 @@ from typing import Any, cast
 
 import httpx
 import pytest
+from sqlalchemy import select
 
 from skillwright_mcp.api import create_app
 from skillwright_mcp.config import Settings
+from skillwright_mcp.db import AuditEventRow
 from skillwright_mcp.runtime import Runtime, build_runtime
 from skillwright_mcp.workflow import WorkflowDefinition
 
@@ -57,12 +59,14 @@ class PersistOnlyDispatcher:
         step: int,
         replacement_element_id: str,
         persist: bool = True,
+        actor_principal_id: str | None = None,
     ) -> dict[str, Any]:
         return await self.runtime.engine.request_repair(
             run_id,
             step=step,
             replacement_element_id=replacement_element_id,
             persist=persist,
+            actor_principal_id=actor_principal_id,
         )
 
     async def decide_approval(
@@ -278,6 +282,10 @@ async def test_control_api_repair_and_approval_interventions_are_authorized_and_
     async with app.router.lifespan_context(app):
         runtime = cast(Runtime, app.state.runtime)
         principal = await runtime.authorization.local_principal()
+        original_requester = await runtime.database.ensure_principal(
+            "original-requester@example.test",
+            "developer",
+        )
         skill, version = await runtime.database.create_skill_version(
             WorkflowDefinition.model_validate(
                 {
@@ -297,7 +305,7 @@ async def test_control_api_repair_and_approval_interventions_are_authorized_and_
             version=version,
             inputs={},
             status="queued",
-            requested_by_principal_id=principal.id,
+            requested_by_principal_id=original_requester.id,
         )
         repair_context = {
             "status": "repair_required",
@@ -369,6 +377,17 @@ async def test_control_api_repair_and_approval_interventions_are_authorized_and_
             assert repair.status_code == 200
             assert repair.json()["status"] == "repair_pending"
             assert "candidates" not in repair.text
+
+            async with runtime.database.sessions() as session:
+                repair_audit = await session.scalar(
+                    select(AuditEventRow).where(
+                        AuditEventRow.event_type == "repair.requested",
+                        AuditEventRow.entity_id == repair.json()["repair_id"],
+                    )
+                )
+            assert repair_audit is not None
+            assert repair_audit.principal_id == principal.id
+            assert repair_audit.principal_id != original_requester.id
 
             approval_view = await client.get(
                 f"/api/v1/runs/{approval_run.id}/intervention"

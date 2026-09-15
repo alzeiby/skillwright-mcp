@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import quote, quote_plus
@@ -26,11 +27,30 @@ from skillwright_mcp.workflow import WorkflowDefinition
 
 SECRET_ENV_NAME = "SKILLWRIGHT_SECRET_TEST_PASSWORD"
 SECRET_SENTINEL = "p@ss word!#$%&'()*+,/:;=?[]{}\\\"<>|~"
+_PERCENT_ESCAPE_RE = re.compile(r"%[0-9A-Fa-f]{2}")
+
+
+def _lower_percent_escapes(value: str) -> str:
+    return _PERCENT_ESCAPE_RE.sub(lambda match: match.group(0).lower(), value)
+
+
+def _forbidden_secret_variants(value: str) -> set[str]:
+    encoded = quote(value, safe="")
+    encoded_plus = quote_plus(value)
+    return {
+        value,
+        encoded,
+        encoded_plus,
+        _lower_percent_escapes(encoded),
+        _lower_percent_escapes(encoded_plus),
+    }
 
 
 class SecretFixturePlaywright:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.last_secret: str | None = None
+        self.close_calls = 0
 
     async def has_tool(self, _tool_name: str) -> bool:
         return False
@@ -43,32 +63,44 @@ class SecretFixturePlaywright:
         args = dict(arguments or {})
         self.calls.append((tool_name, args))
         if tool_name == "browser_snapshot":
-            text = "\n".join(
-                [
-                    "- Page URL: https://secret.test/login",
-                    "- Page Title: Secret fixture",
-                    '- textbox "Password" [ref=e1]',
-                ]
-            )
+            lines = [
+                "- Page URL: https://secret.test/login",
+                "- Page Title: Secret fixture",
+                '- textbox "Password" [ref=e1]',
+            ]
+            if self.last_secret is not None:
+                lines.append(f'- text "echo={self.last_secret}"')
+            text = "\n".join(lines)
             raw = {"text": text}
             structured: dict[str, Any] | None = None
         elif tool_name == "browser_type":
             secret = cast(str, args["text"])
+            self.last_secret = secret
             encoded = quote(secret, safe="")
             encoded_plus = quote_plus(secret)
-            text = f"typed={secret} encoded={encoded} encoded_plus={encoded_plus}"
+            encoded_lower = _lower_percent_escapes(encoded)
+            encoded_plus_lower = _lower_percent_escapes(encoded_plus)
+            text = (
+                f"typed={secret} encoded={encoded} encoded_plus={encoded_plus} "
+                f"encoded_lower={encoded_lower} encoded_plus_lower={encoded_plus_lower}"
+            )
             raw = {
                 "text": text,
                 "echo": secret,
                 "encoded": encoded,
                 "encoded_plus": encoded_plus,
+                "encoded_lower": encoded_lower,
+                "encoded_plus_lower": encoded_plus_lower,
                 secret: "secret-used-as-a-response-key",
             }
             structured = {
                 "echo": secret,
                 "encoded": encoded,
                 "encoded_plus": encoded_plus,
+                "encoded_lower": encoded_lower,
+                "encoded_plus_lower": encoded_plus_lower,
                 encoded: "encoded-secret-used-as-a-response-key",
+                encoded_lower: "lowercase-encoded-secret-used-as-a-response-key",
             }
         else:
             raise AssertionError(f"unexpected browser tool: {tool_name} {args}")
@@ -79,6 +111,9 @@ class SecretFixturePlaywright:
             structured_content=structured,
             raw=raw,
         )
+
+    async def close(self) -> None:
+        self.close_calls += 1
 
 
 def _secret_workflow() -> WorkflowDefinition:
@@ -123,11 +158,7 @@ async def test_bound_secret_reaches_playwright_but_never_persists(
     monkeypatch.setenv(SECRET_ENV_NAME, SECRET_SENTINEL)
     database_name = "secret-success.db"
     database, engine, fake, skill_id = await _runtime(tmp_path, database_name)
-    forbidden = {
-        SECRET_SENTINEL,
-        quote(SECRET_SENTINEL, safe=""),
-        quote_plus(SECRET_SENTINEL),
-    }
+    forbidden = _forbidden_secret_variants(SECRET_SENTINEL)
     try:
         await database.bind_skill_secret(
             skill_id=skill_id,
@@ -203,11 +234,7 @@ async def test_explicit_secret_fill_returns_only_redacted_echoes(tmp_path: Path)
     await database.initialize(create_schema=True)
     fake = SecretFixturePlaywright()
     browser = BrowserController(cast(Any, fake), database)
-    forbidden = {
-        SECRET_SENTINEL,
-        quote(SECRET_SENTINEL, safe=""),
-        quote_plus(SECRET_SENTINEL),
-    }
+    forbidden = _forbidden_secret_variants(SECRET_SENTINEL)
     try:
         result = await browser.fill_secret(
             "e1",
@@ -229,6 +256,36 @@ async def test_explicit_secret_fill_returns_only_redacted_echoes(tmp_path: Path)
         returned = json.dumps(result.as_dict(), default=str, sort_keys=True)
         assert all(value not in returned for value in forbidden)
         assert "[REDACTED]" in returned
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_session_redactor_survives_later_page_then_releases_on_browser_close(
+    tmp_path: Path,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'secret-lifecycle.db').as_posix()}")
+    await database.initialize(create_schema=True)
+    fake = SecretFixturePlaywright()
+    browser = BrowserController(cast(Any, fake), database)
+    try:
+        await browser.fill_secret(
+            "e1",
+            SECRET_SENTINEL,
+            secret_ref="TEST_PASSWORD",
+            input_name="password",
+        )
+        later_page = await browser.snapshot()
+
+        assert later_page.result is not None
+        assert SECRET_SENTINEL not in later_page.result.text
+        assert "[REDACTED]" in later_page.result.text
+
+        await browser.close()
+
+        assert fake.close_calls == 1
+        assert browser.latest_snapshot is None
+        assert browser._session_redactor.text(SECRET_SENTINEL) == SECRET_SENTINEL
     finally:
         await database.close()
 
@@ -352,11 +409,7 @@ async def test_secret_is_re_resolved_and_redacted_after_approval_resume(
         type_calls = [args for tool_name, args in fake.calls if tool_name == "browser_type"]
         assert len(type_calls) == 1
         assert type_calls[0]["text"] == SECRET_SENTINEL
-        forbidden = {
-            SECRET_SENTINEL,
-            quote(SECRET_SENTINEL, safe=""),
-            quote_plus(SECRET_SENTINEL),
-        }
+        forbidden = _forbidden_secret_variants(SECRET_SENTINEL)
         async with database.sessions() as session:
             actions = (
                 await session.scalars(
