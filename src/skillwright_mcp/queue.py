@@ -24,6 +24,7 @@ from .observability import (
     record_queue_publish,
 )
 from .playwright import PlaywrightMCPClient
+from .secrets import SecretResolver
 from .telemetry import stale_recovery_recorded
 
 _worker_settings = Settings()
@@ -64,12 +65,23 @@ async def execute_run(run_id: str) -> dict[str, Any]:
             / run_directory_key
         }
     )
-    database = Database(settings.database_url)
+    database = Database(
+        settings.resolved_database_url(),
+        connect_args=settings.resolved_database_connect_args(),
+    )
     await database.initialize(create_schema=False)
     authorization = AuthorizationService(database, settings)
     playwright = PlaywrightMCPClient(browser_settings)
     browser = BrowserController(playwright, database)
-    engine = WorkflowEngine(database, browser, authorization)
+    engine = WorkflowEngine(
+        database,
+        browser,
+        authorization,
+        SecretResolver(
+            aws_region=settings.aws_region,
+            aws_timeout_seconds=settings.aws_secret_resolution_timeout_seconds,
+        ),
+    )
     worker_id = _worker_id()
     try:
         result = await engine.execute_persisted_run(run_id, worker_id=worker_id)

@@ -262,11 +262,21 @@ overwriting a newer version.
 
 ## Secret-safe recording and execution
 
-Secrets require the explicit secret path. The current secret provider is the server environment;
-a reference such as `LOGIN_PASSWORD` resolves to `SKILLWRIGHT_SECRET_LOGIN_PASSWORD`. Secret refs
-must match `[A-Z][A-Z0-9_]*`.
+Secrets require the explicit secret path. Skillwright supports three server-side providers:
 
-Configure the value only in the process that needs to execute or demonstrate the secret action:
+- `env`: a logical reference such as `LOGIN_PASSWORD` resolves to
+  `SKILLWRIGHT_SECRET_LOGIN_PASSWORD`; env refs must match `[A-Z][A-Z0-9_]*`;
+- `aws-secrets-manager`: resolves a Secrets Manager name or full ARN and requires a string secret;
+- `aws-ssm`: resolves an SSM Parameter Store name/ARN with decryption enabled.
+
+AWS lookups use the standard AWS SDK credential chain (the ECS task role in the included AWS
+deployment) and run outside the asyncio event loop. SDK clients may be reused, but plaintext secret
+values are never cached by Skillwright. Managed-provider calls are bounded by
+`SKILLWRIGHT_AWS_SECRET_RESOLUTION_TIMEOUT_SECONDS` (15 seconds by default, capped below the
+minimum stale-run window); the included ECS deployment resolves secrets in its configured region.
+
+For the env provider, configure the value only in the process that needs to execute or demonstrate
+the secret action:
 
 ```dotenv
 SKILLWRIGHT_SECRET_LOGIN_PASSWORD=<secret value>
@@ -282,6 +292,7 @@ browser_fill_secret(
   target="e7",
   secret_ref="LOGIN_PASSWORD",
   input_name="password",
+  provider="env",
   element="Password"
 )
 skill_record_stop()
@@ -293,12 +304,13 @@ value, and redacts raw and URL-encoded variants from captured browser results an
 in that browser session. Compilation creates a required secret string input such as
 `{{ password }}` and automatically binds that input to the recorded secret reference.
 
-Use `skill_secret_status` to see which secret inputs are configured without exposing their refs or
-values. Administrators with `manage` permission can change a binding with `skill_secret_bind` or
-remove it with `skill_secret_unbind`. A run with a missing binding returns `secret_unavailable`;
-if the binding exists but its environment value is unavailable when execution begins or resumes,
-the run fails before that browser action starts. Values are resolved again after approval/repair
-resumption, so rotating an environment secret does not require a workflow-version change.
+Use `skill_secret_status` to see which secret inputs are configured and which provider backs them
+without exposing their refs or values. Administrators with `manage` permission can change a binding
+with `skill_secret_bind(name, input_name, secret_ref, provider=...)` or remove it with
+`skill_secret_unbind`. A run with a missing binding returns `secret_unavailable`; if the binding
+exists but its provider cannot resolve a non-empty string when execution begins or resumes, the run
+fails before that browser action starts. Values are resolved again after approval/repair resumption,
+so rotating an env, Secrets Manager, or SSM value does not require a workflow-version change.
 
 `browser_fill` is **not secret-safe**. Its `text` argument is ordinary browser input and can be
 stored in browser-action history, snapshots, run evidence, and logs/results. Never put credentials
@@ -540,22 +552,30 @@ should still keep secrets out of every ordinary/non-secret input field.
 - The repository is backend-only. It currently ships no web frontend and no Kubernetes manifests.
   Docker/Compose is the included deployment topology.
 
-## Production / AWS next steps
+## AWS / ECS deployment
 
-The current container/Compose topology maps cleanly to an initial AWS deployment: publish the
-single image to ECR; run the API, MCP service, and workers as separate ECS/Fargate services; run
-Alembic as a one-off deployment task; use RDS PostgreSQL and ElastiCache Redis; and send OTLP to an
-ADOT/OpenTelemetry Collector for CloudWatch/X-Ray or a Prometheus-compatible backend. Put the API
-and MCP endpoints behind TLS and private/network controls appropriate to their callers, and keep
-workers/database/Redis in private subnets.
+Production-oriented Terraform now lives in `infra/aws/terraform`. It provisions an immutable ECR
+repository; separate API, stateful MCP, and deterministic worker ECS/Fargate services; a one-off
+Alembic migration task; RDS PostgreSQL with separate administrator and least-privilege runtime
+identities; encrypted TLS-only ElastiCache Redis; an HTTPS ALB; ADOT sidecars exporting traces to
+X-Ray and metrics through EMF; CloudWatch logs; per-purpose task IAM policies; a digest-pinned ADOT
+collector; autoscaling hooks; and backup/retention controls.
 
-Before horizontally scaling the stateful Streamable HTTP MCP service, preserve session affinity so
-each MCP session keeps reaching the process that owns its interactive browser session, or move
-interactive browser-session state behind a separately managed browser service. The next security
-integration should add an AWS Secrets Manager or SSM-backed secret provider while preserving the
-same opaque workflow binding contract. Managed browser-artifact storage, worker autoscaling, and
-backup/retention policy can then be added independently. No Kubernetes layer is required for that
-path.
+The stack keeps application tasks, RDS, and Redis in private subnets. RDS's AWS-managed master
+credential is injected only into the one-off migration task. That task initializes a separate
+Secrets Manager credential and constrained PostgreSQL login for the API, MCP, and worker services;
+the runtime login cannot create roles/databases or mutate the Alembic version marker. PostgreSQL
+connections use `verify-full` TLS with the AWS RDS global CA bundle checksum-pinned into the image.
+Workflow Secrets Manager/SSM access is granted separately from explicit ARN allow-lists.
+
+The current Streamable HTTP MCP process owns interactive browser sessions in memory. The Terraform
+MCP target group therefore enables ALB cookie stickiness, and the MCP process uses ECS task scale-in
+protection while it owns interactive sessions so rolling deployments/autoscaling do not drain that
+task mid-session. Clients must retain the ALB cookie for the MCP session. A migration-image marker
+also gates all service promotion: a candidate image must run the migration task successfully before
+Terraform can roll API/MCP/worker services to that tag. See `infra/aws/terraform/README.md` for the
+exact release sequence, network requirements, secret-provider permissions, and operational
+controls. No Kubernetes layer or frontend is part of the deployment.
 
 ## Container image
 
@@ -634,8 +654,9 @@ MCP server, and worker:
 docker compose --profile app up -d --build --wait
 ```
 
-The migration job must exit successfully before the API, MCP server, and worker start. The API
-readiness check verifies PostgreSQL and Redis, the MCP service has a transport health check, and
+The migration job must exit successfully before the API, MCP server, and worker start. Both API and
+MCP readiness checks verify PostgreSQL, the exact Alembic schema head, and Redis without starting
+Playwright, and
 the OpenTelemetry collector exposes Prometheus metrics at `http://127.0.0.1:9464/metrics`.
 Application endpoints are bound to loopback at `http://127.0.0.1:8767` (control API) and
 `http://127.0.0.1:8766/mcp` (MCP).

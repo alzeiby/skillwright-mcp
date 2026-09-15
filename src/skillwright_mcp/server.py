@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any, Literal, cast
@@ -8,6 +10,8 @@ from mcp.server import MCPServer
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import Context, authenticated_principal
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from . import __version__
 from .auth import (
@@ -20,13 +24,15 @@ from .auth import (
 from .browser import BrowserController
 from .config import Settings
 from .db import PrincipalRow, RunRow, SkillRow
-from .runtime import Runtime, runtime_lifespan
-from .secrets import SecretResolutionError, validate_secret_ref
+from .runtime import Runtime, build_runtime
+from .secrets import SecretProvider, SecretResolutionError, validate_secret_ref
 from .skills import SkillService
 from .workflow import ParameterBinding
 
 AppContext = Runtime
+logger = logging.getLogger(__name__)
 _server_settings = Settings()
+_http_runtime: Runtime | None = None
 _bearer_auth = BearerTokenAuthenticator(_server_settings.auth_token_hashes)
 _token_verifier = (
     MCPBearerTokenVerifier(
@@ -52,8 +58,24 @@ _auth_settings = (
 
 @asynccontextmanager
 async def app_lifespan(_: MCPServer[AppContext]) -> AsyncIterator[AppContext]:
-    async with runtime_lifespan(_server_settings) as runtime:
+    global _http_runtime
+
+    runtime = build_runtime(_server_settings)
+    previous_runtime = _http_runtime
+    _http_runtime = runtime
+    try:
+        try:
+            async with asyncio.timeout(_server_settings.healthcheck_timeout_seconds):
+                await runtime.start()
+        except Exception as exc:
+            logger.warning(
+                "MCP server started before dependencies were ready (%s)",
+                type(exc).__name__,
+            )
         yield runtime
+    finally:
+        _http_runtime = previous_runtime
+        await runtime.close()
 
 
 mcp = MCPServer(
@@ -69,6 +91,31 @@ mcp = MCPServer(
     auth=_auth_settings,
     token_verifier=_token_verifier,
 )
+
+
+async def health_ready(_: Request) -> JSONResponse:
+    runtime = _http_runtime
+    if runtime is None:
+        return JSONResponse(status_code=503, content={"status": "not_ready"})
+
+    try:
+        checks = await runtime.readiness()
+    except Exception:
+        return JSONResponse(status_code=503, content={"status": "not_ready"})
+
+    if not checks or any(value != "ok" for value in checks.values()):
+        return JSONResponse(status_code=503, content={"status": "not_ready"})
+
+    try:
+        async with asyncio.timeout(runtime.settings.healthcheck_timeout_seconds):
+            await runtime.start()
+    except Exception:
+        return JSONResponse(status_code=503, content={"status": "not_ready"})
+
+    return JSONResponse(status_code=200, content={"status": "ready"})
+
+
+mcp.custom_route("/health/ready", methods=["GET"])(health_ready)
 
 
 def _app(ctx: Context[AppContext]) -> AppContext:
@@ -243,6 +290,7 @@ async def browser_fill_secret(
     secret_ref: str,
     input_name: str,
     ctx: Context[AppContext],
+    provider: SecretProvider = "env",
     element: str | None = None,
     submit: bool = False,
 ) -> dict[str, Any]:
@@ -252,8 +300,8 @@ async def browser_fill_secret(
     principal = await _principal(ctx)
     app.authorization.require_global(principal, "admin")
     try:
-        normalized_ref = validate_secret_ref(secret_ref)
-        secret_value = app.engine.secret_resolver.resolve(normalized_ref)
+        normalized_ref = validate_secret_ref(secret_ref, provider=provider)
+        secret_value = await app.engine.secret_resolver.resolve(normalized_ref, provider=provider)
     except (ValueError, SecretResolutionError) as exc:
         return {"ok": False, "error": str(exc)}
     async with _browser_session(ctx, principal) as browser:
@@ -263,6 +311,7 @@ async def browser_fill_secret(
                 secret_value,
                 secret_ref=normalized_ref,
                 input_name=input_name,
+                provider=provider,
                 element=element,
                 submit=submit,
                 actor_principal_id=principal.id,
@@ -457,8 +506,9 @@ async def skill_secret_bind(
     input_name: str,
     secret_ref: str,
     ctx: Context[AppContext],
+    provider: SecretProvider = "env",
 ) -> dict[str, Any]:
-    """Bind a secret workflow input to a server-managed environment secret reference."""
+    """Bind a secret workflow input to a server-managed secret reference."""
 
     app = _app(ctx)
     principal, _ = await _skill(ctx, name, "manage")
@@ -467,6 +517,7 @@ async def skill_secret_bind(
         name,
         input_name=input_name,
         secret_ref=secret_ref,
+        provider=provider,
         principal_id=principal.id,
     )
 

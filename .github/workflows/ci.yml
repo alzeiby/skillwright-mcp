@@ -26,6 +26,23 @@ jobs:
       - run: uv sync --frozen --all-extras
       - run: uv run ruff check src tests alembic
       - run: uv run mypy src/skillwright_mcp
+      - name: Validate AWS Terraform
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work/infra/aws/terraform \
+            hashicorp/terraform:1.13.5 \
+            fmt -check -recursive
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work/infra/aws/terraform \
+            hashicorp/terraform:1.13.5 \
+            init -backend=false -input=false -lockfile=readonly
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work/infra/aws/terraform \
+            hashicorp/terraform:1.13.5 \
+            validate
 
   unit:
     runs-on: ubuntu-latest
@@ -180,8 +197,11 @@ jobs:
             test ! -x /usr/local/bin/npx
             command -v playwright-mcp >/dev/null
             test -x /usr/local/bin/skillwright-chromium
+            test -r /etc/ssl/certs/aws-rds-global-bundle.pem
             find /ms-playwright -maxdepth 1 -type d -name "chromium*" | grep -q .
           '
+          docker run --rm --entrypoint /opt/skillwright/bin/python skillwright-mcp:ci -c \
+            "import ssl; ssl.create_default_context(cafile='/etc/ssl/certs/aws-rds-global-bundle.pem')"
       - name: Verify offline Playwright MCP wrapper
         run: >-
           docker run --rm

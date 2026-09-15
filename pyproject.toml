@@ -26,6 +26,7 @@ dependencies = [
   "taskiq[opentelemetry]>=0.12,<0.13",
   "taskiq-redis>=1.2,<2",
   "uvicorn>=0.31,<1",
+  "boto3>=1.43,<2",
 ]
 
 [project.optional-dependencies]

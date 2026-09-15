@@ -245,7 +245,7 @@ class WorkflowEngine:
                 definition["steps"][index]["target"] = target
         workflow = WorkflowDefinition.model_validate(definition)
         try:
-            variables, redactor = self._resolve_run_variables(claimed)
+            variables, redactor = await self._resolve_run_variables(claimed)
         except SecretResolutionError:
             failure = {
                 "status": "failed",
@@ -420,7 +420,7 @@ class WorkflowEngine:
             return result
 
         try:
-            variables, redactor = self._resolve_run_variables(run)
+            variables, redactor = await self._resolve_run_variables(run)
         except SecretResolutionError:
             result = {
                 "status": "failed",
@@ -730,7 +730,7 @@ class WorkflowEngine:
                 definition["steps"][index]["target"] = target
         workflow = WorkflowDefinition.model_validate(definition)
         try:
-            variables, redactor = self._resolve_run_variables(run)
+            variables, redactor = await self._resolve_run_variables(run)
         except SecretResolutionError:
             failure = {
                 "status": "failed",
@@ -792,18 +792,33 @@ class WorkflowEngine:
             redactor=redactor,
         )
 
-    def _resolve_run_variables(self, run: RunRow) -> tuple[dict[str, Any], Redactor]:
+    async def _resolve_run_variables(self, run: RunRow) -> tuple[dict[str, Any], Redactor]:
         variables: dict[str, Any] = {}
-        secret_values: list[str] = []
+        secret_bindings: list[tuple[str, str, str]] = []
         for name, stored_value in run.inputs.items():
             binding = secret_binding_from_marker(stored_value)
             if binding is None:
                 variables[name] = stored_value
                 continue
             provider, reference = binding
-            value = self.secret_resolver.resolve(reference, provider=provider)
-            variables[name] = value
-            secret_values.append(value)
+            secret_bindings.append((name, provider, reference))
+
+        secret_values: list[str] = []
+        if secret_bindings:
+            resolved = await asyncio.gather(
+                *(
+                    self.secret_resolver.resolve(reference, provider=provider)
+                    for _name, provider, reference in secret_bindings
+                )
+            )
+            for (name, _provider, _reference), value in zip(
+                secret_bindings,
+                resolved,
+                strict=True,
+            ):
+                variables[name] = value
+                secret_values.append(value)
+
         variables.update(run.outputs)
         return variables, Redactor.from_values(secret_values)
 

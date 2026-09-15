@@ -19,8 +19,9 @@ from skillwright_mcp.workflow import WorkflowDefinition
 
 
 class SlowWaitPlaywright:
-    def __init__(self) -> None:
+    def __init__(self, *, wait_seconds: float = 0.2) -> None:
         self.calls: list[str] = []
+        self.wait_seconds = wait_seconds
 
     async def has_tool(self, _tool_name: str) -> bool:
         return False
@@ -32,7 +33,7 @@ class SlowWaitPlaywright:
     ) -> BrowserResult:
         self.calls.append(tool_name)
         if tool_name == "browser_wait_for":
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(self.wait_seconds)
             text = "waited"
         elif tool_name == "browser_navigate":
             text = "navigated"
@@ -466,26 +467,28 @@ async def test_continuous_heartbeat_covers_long_step_and_prevents_stale_requeue(
     )
     skill, version = await database.create_skill_version(workflow)
     run = await database.create_run(skill=skill, version=version, inputs={}, status="queued")
-    fake = SlowWaitPlaywright()
+    fake = SlowWaitPlaywright(wait_seconds=0.8)
     engine = WorkflowEngine(database, BrowserController(cast(Any, fake), database))
-    monkeypatch.setattr(engine_module, "RUN_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(engine_module, "RUN_HEARTBEAT_INTERVAL_SECONDS", 0.02)
     original_heartbeat = database.heartbeat_run
-    heartbeat_observed = asyncio.Event()
-    heartbeat_calls = 0
+    heartbeat_times: asyncio.Queue[float] = asyncio.Queue()
 
     async def observed_heartbeat(run_id: str, worker_id: str) -> bool:
-        nonlocal heartbeat_calls
         alive = await original_heartbeat(run_id, worker_id)
-        heartbeat_calls += 1
-        if heartbeat_calls >= 3:
-            heartbeat_observed.set()
+        await heartbeat_times.put(asyncio.get_running_loop().time())
         return alive
 
     monkeypatch.setattr(database, "heartbeat_run", observed_heartbeat)
     task = asyncio.create_task(engine.execute_persisted_run(run.id, worker_id="worker-long"))
     try:
-        await asyncio.wait_for(heartbeat_observed.wait(), timeout=0.5)
-        recovered = await database.recover_stale_runs(0.05)
+        # Let the run become older than the stale window, then require a heartbeat committed
+        # after that point. This proves the continuous heartbeat?not merely the initial claim?
+        # keeps a long browser step alive without depending on sub-SQLite-IO timing.
+        await asyncio.sleep(0.35)
+        while not heartbeat_times.empty():
+            heartbeat_times.get_nowait()
+        await asyncio.wait_for(heartbeat_times.get(), timeout=0.5)
+        recovered = await database.recover_stale_runs(0.25)
         assert run.id not in recovered["requeued"]
         assert run.id not in recovered["failed_unknown"]
         result = await task

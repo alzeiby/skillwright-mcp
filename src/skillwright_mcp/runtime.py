@@ -14,9 +14,11 @@ from .auth import AuthorizationService, BearerTokenAuthenticator
 from .browser import BrowserController
 from .config import Settings
 from .db import SCHEMA_REVISION, Database, RunRow
+from .ecs import EcsTaskProtection
 from .engine import WorkflowEngine
 from .playwright import PlaywrightMCPClient
 from .queue import RunDispatcher
+from .secrets import SecretResolver
 from .skills import SkillService
 
 INTERACTIVE_BROWSER_IDLE_TIMEOUT_SECONDS = 30 * 60.0
@@ -47,6 +49,7 @@ class BrowserSessionPool:
         idle_timeout_seconds: float = INTERACTIVE_BROWSER_IDLE_TIMEOUT_SECONDS,
         cleanup_interval_seconds: float = _INTERACTIVE_BROWSER_CLEANUP_INTERVAL_SECONDS,
         clock: Callable[[], float] = monotonic,
+        task_protection: EcsTaskProtection | None = None,
     ) -> None:
         if idle_timeout_seconds <= 0:
             raise ValueError("idle_timeout_seconds must be positive")
@@ -56,6 +59,7 @@ class BrowserSessionPool:
         self._idle_timeout_seconds = idle_timeout_seconds
         self._cleanup_interval_seconds = min(cleanup_interval_seconds, idle_timeout_seconds)
         self._clock = clock
+        self._task_protection = task_protection
         self._entries: dict[str, _BrowserSessionEntry] = {}
         self._lock = asyncio.Lock()
         self._cleanup_task: asyncio.Task[None] | None = None
@@ -76,6 +80,8 @@ class BrowserSessionPool:
 
         self.start()
         async with self._lock:
+            if self._task_protection is not None:
+                await self._task_protection.protect()
             entry = self._entries.get(key)
             if entry is None:
                 entry = _BrowserSessionEntry(
@@ -104,13 +110,18 @@ class BrowserSessionPool:
 
         cutoff = self._clock() - self._idle_timeout_seconds
         stale: list[BrowserController] = []
+        became_idle = False
         async with self._lock:
             for key, entry in list(self._entries.items()):
                 if entry.leases == 0 and entry.last_used <= cutoff:
                     stale.append(entry.browser)
                     del self._entries[key]
+            became_idle = bool(stale) and not self._entries
         if stale:
             await asyncio.gather(*(browser.close() for browser in stale), return_exceptions=True)
+        if became_idle and self._task_protection is not None:
+            with suppress(RuntimeError):
+                await self._task_protection.unprotect()
 
     async def close(self) -> None:
         if self._closed:
@@ -126,6 +137,9 @@ class BrowserSessionPool:
             self._entries.clear()
         if browsers:
             await asyncio.gather(*(browser.close() for browser in browsers), return_exceptions=True)
+        if self._task_protection is not None:
+            with suppress(RuntimeError):
+                await self._task_protection.unprotect()
 
     async def _cleanup_loop(self) -> None:
         while True:
@@ -230,16 +244,28 @@ class Runtime:
 
 def build_runtime(settings: Settings | None = None) -> Runtime:
     resolved = settings or Settings()
-    database = Database(resolved.database_url)
+    database = Database(
+        resolved.resolved_database_url(),
+        connect_args=resolved.resolved_database_connect_args(),
+    )
     authorization = AuthorizationService(database, resolved)
     bearer_auth = BearerTokenAuthenticator(resolved.auth_token_hashes)
     playwright = PlaywrightMCPClient(resolved)
     browser = BrowserController(playwright, database)
-    engine = WorkflowEngine(database, browser, authorization)
+    engine = WorkflowEngine(
+        database,
+        browser,
+        authorization,
+        SecretResolver(
+            aws_region=resolved.aws_region,
+            aws_timeout_seconds=resolved.aws_secret_resolution_timeout_seconds,
+        ),
+    )
     skills = SkillService(database, browser, engine)
     dispatcher = RunDispatcher(settings=resolved, database=database, engine=engine)
     interactive_browsers = BrowserSessionPool(
-        lambda key: _build_interactive_browser(resolved, database, key)
+        lambda key: _build_interactive_browser(resolved, database, key),
+        task_protection=EcsTaskProtection.from_environment(),
     )
     return Runtime(
         settings=resolved,

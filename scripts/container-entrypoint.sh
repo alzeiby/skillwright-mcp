@@ -26,7 +26,11 @@ case "$role" in
             "$@"
         ;;
     migrate)
-        exec alembic upgrade head "$@"
+        if [ "$#" -gt 0 ]; then
+            echo "migrate does not accept additional arguments" >&2
+            exit 2
+        fi
+        exec python -m skillwright_mcp.migrate
         ;;
     *)
         exec "$role" "$@"

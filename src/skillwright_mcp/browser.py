@@ -204,6 +204,7 @@ class BrowserController:
         *,
         secret_ref: str,
         input_name: str,
+        provider: str = "env",
         element: str | None = None,
         submit: bool = False,
         source: str = "agent",
@@ -214,6 +215,7 @@ class BrowserController:
             "target": target,
             "secret_ref": secret_ref,
             "input_name": input_name,
+            "provider": provider,
             "element": element,
             "submit": submit,
         }

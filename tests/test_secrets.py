@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import quote, quote_plus
@@ -23,6 +25,8 @@ from skillwright_mcp.db import (
 )
 from skillwright_mcp.engine import WorkflowEngine
 from skillwright_mcp.playwright import BrowserResult
+from skillwright_mcp.secrets import SecretResolutionError, SecretResolver, secret_marker
+from skillwright_mcp.skills import SkillService
 from skillwright_mcp.workflow import WorkflowDefinition
 
 SECRET_ENV_NAME = "SKILLWRIGHT_SECRET_TEST_PASSWORD"
@@ -148,6 +152,276 @@ async def _runtime(tmp_path: Path, database_name: str) -> tuple[
 
 def _row_payload(row: Any) -> dict[str, Any]:
     return {column.name: getattr(row, column.name) for column in row.__table__.columns}
+
+
+class FakeSecretsManagerClient:
+    def __init__(self, value: object) -> None:
+        self.value = value
+        self.requests: list[str] = []
+
+    def get_secret_value(self, *, SecretId: str) -> dict[str, object]:
+        self.requests.append(SecretId)
+        if isinstance(self.value, BaseException):
+            raise self.value
+        if isinstance(self.value, bytes):
+            return {"SecretBinary": self.value}
+        return {"SecretString": self.value}
+
+
+class FakeSSMClient:
+    def __init__(self, value: object) -> None:
+        self.value = value
+        self.requests: list[tuple[str, bool]] = []
+
+    def get_parameter(self, *, Name: str, WithDecryption: bool) -> dict[str, object]:
+        self.requests.append((Name, WithDecryption))
+        if isinstance(self.value, BaseException):
+            raise self.value
+        return {"Parameter": {"Value": self.value}}
+
+
+@pytest.mark.asyncio
+async def test_aws_secret_resolver_uses_off_event_loop_clients_without_caching_values() -> None:
+    secrets_client = FakeSecretsManagerClient("first-secret")
+    ssm_client = FakeSSMClient("parameter-secret")
+    created: list[tuple[str, str | None]] = []
+
+    def client_factory(service_name: str, region_name: str | None) -> object:
+        created.append((service_name, region_name))
+        return secrets_client if service_name == "secretsmanager" else ssm_client
+
+    resolver = SecretResolver(
+        aws_region="us-east-1",
+        aws_client_factory=client_factory,
+    )
+
+    assert (
+        await resolver.resolve(
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:portal-password-AbCdEf",
+            provider="aws-secrets-manager",
+        )
+        == "first-secret"
+    )
+    secrets_client.value = "rotated-secret"
+    assert (
+        await resolver.resolve(
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:portal-password-AbCdEf",
+            provider="aws-secrets-manager",
+        )
+        == "rotated-secret"
+    )
+    assert await resolver.resolve("/skillwright/prod/password", provider="aws-ssm") == (
+        "parameter-secret"
+    )
+
+    assert created == [("secretsmanager", "us-east-1"), ("ssm", "us-east-1")]
+    assert len(secrets_client.requests) == 2
+    assert ssm_client.requests == [("/skillwright/prod/password", True)]
+
+
+@pytest.mark.asyncio
+async def test_aws_secret_resolver_times_out_before_run_stale_window() -> None:
+    class SlowSecretsManagerClient:
+        def get_secret_value(self, *, SecretId: str) -> dict[str, object]:
+            del SecretId
+            time.sleep(0.05)
+            return {"SecretString": "too-late"}
+
+    resolver = SecretResolver(
+        aws_timeout_seconds=0.01,
+        aws_client_factory=lambda _service, _region: SlowSecretsManagerClient(),
+    )
+
+    with pytest.raises(SecretResolutionError, match="secret resolution timed out"):
+        await resolver.resolve("slow-secret", provider="aws-secrets-manager")
+
+
+@pytest.mark.asyncio
+async def test_aws_secret_resolver_rejects_binary_and_sanitizes_sdk_failures() -> None:
+    binary = FakeSecretsManagerClient(b"binary-secret")
+    failing = FakeSSMClient(RuntimeError("request failed for /sensitive/reference"))
+
+    def client_factory(service_name: str, _region_name: str | None) -> object:
+        return binary if service_name == "secretsmanager" else failing
+
+    resolver = SecretResolver(aws_client_factory=client_factory)
+
+    with pytest.raises(SecretResolutionError, match="binary Secrets Manager values"):
+        await resolver.resolve("my-secret", provider="aws-secrets-manager")
+    with pytest.raises(SecretResolutionError, match="secret could not be resolved") as exc_info:
+        await resolver.resolve("/sensitive/reference", provider="aws-ssm")
+    assert "/sensitive/reference" not in str(exc_info.value)
+
+
+def test_secret_marker_accepts_aws_providers_but_keeps_env_refs_strict() -> None:
+    assert secret_marker("TEST_PASSWORD") == {
+        "$secret": {"provider": "env", "reference": "TEST_PASSWORD"}
+    }
+    assert secret_marker("prod/portal-password", provider="aws-secrets-manager") == {
+        "$secret": {
+            "provider": "aws-secrets-manager",
+            "reference": "prod/portal-password",
+        }
+    }
+    assert secret_marker("/skillwright/prod/password", provider="aws-ssm") == {
+        "$secret": {"provider": "aws-ssm", "reference": "/skillwright/prod/password"}
+    }
+    with pytest.raises(ValueError, match="secret reference must match"):
+        secret_marker("prod/password", provider="env")
+    with pytest.raises(ValueError, match="unsupported secret provider"):
+        secret_marker("anything", provider="vault")
+
+
+@pytest.mark.asyncio
+async def test_multiple_managed_secret_inputs_resolve_concurrently(tmp_path: Path) -> None:
+    class TrackingResolver(SecretResolver):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.max_active = 0
+
+        async def resolve(self, secret_ref: str, *, provider: str = "env") -> str:
+            assert provider == "aws-secrets-manager"
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                await asyncio.sleep(0.03)
+                return f"value-for-{secret_ref}"
+            finally:
+                self.active -= 1
+
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'aws-concurrent.db').as_posix()}")
+    await database.initialize(create_schema=True)
+    workflow = WorkflowDefinition.model_validate(
+        {
+            "name": "two-managed-secrets",
+            "inputs": {
+                "first": {"type": "string", "secret": True},
+                "second": {"type": "string", "secret": True},
+            },
+            "steps": [
+                {
+                    "op": "fill",
+                    "target": {"role": "textbox", "name": "Password"},
+                    "value": "{{ first }}",
+                },
+                {
+                    "op": "fill",
+                    "target": {"role": "textbox", "name": "Password"},
+                    "value": "{{ second }}",
+                },
+            ],
+        }
+    )
+    skill, _ = await database.create_skill_version(workflow)
+    for input_name in ("first", "second"):
+        await database.bind_skill_secret(
+            skill_id=skill.id,
+            input_name=input_name,
+            provider="aws-secrets-manager",
+            secret_ref=f"skillwright/{input_name}",
+            updated_by_principal_id=None,
+        )
+    resolver = TrackingResolver()
+    fake = SecretFixturePlaywright()
+    engine = WorkflowEngine(
+        database,
+        BrowserController(cast(Any, fake), database),
+        secret_resolver=resolver,
+    )
+    try:
+        result = await engine.run_skill(workflow.name)
+        assert result["status"] == "succeeded"
+        assert resolver.max_active == 2
+        type_calls = [args for tool_name, args in fake.calls if tool_name == "browser_type"]
+        assert [call["text"] for call in type_calls] == [
+            "value-for-skillwright/first",
+            "value-for-skillwright/second",
+        ]
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_aws_bound_workflow_secret_reaches_browser_without_plaintext_persistence(
+    tmp_path: Path,
+) -> None:
+    database_name = "aws-secret-run.db"
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / database_name).as_posix()}")
+    await database.initialize(create_schema=True)
+    workflow = _secret_workflow()
+    skill, _ = await database.create_skill_version(workflow)
+    reference = "arn:aws:secretsmanager:us-east-1:123456789012:secret:portal-password-AbCdEf"
+    secret_value = "aws-managed-secret-value"
+    secrets_client = FakeSecretsManagerClient(secret_value)
+    resolver = SecretResolver(
+        aws_region="us-east-1",
+        aws_client_factory=lambda _service, _region: secrets_client,
+    )
+    fake = SecretFixturePlaywright()
+    browser = BrowserController(cast(Any, fake), database)
+    engine = WorkflowEngine(database, browser, secret_resolver=resolver)
+    await database.bind_skill_secret(
+        skill_id=skill.id,
+        input_name="password",
+        provider="aws-secrets-manager",
+        secret_ref=reference,
+        updated_by_principal_id=None,
+    )
+    try:
+        result = await engine.run_skill(workflow.name)
+
+        assert result["status"] == "succeeded"
+        type_calls = [args for tool_name, args in fake.calls if tool_name == "browser_type"]
+        assert type_calls[0]["text"] == secret_value
+        async with database.sessions() as session:
+            run = await session.scalar(select(RunRow).where(RunRow.skill_id == skill.id))
+        assert run is not None
+        assert run.inputs["password"] == {
+            "$secret": {"provider": "aws-secrets-manager", "reference": reference}
+        }
+        assert secret_value not in json.dumps(_row_payload(run), default=str, sort_keys=True)
+    finally:
+        await database.close()
+
+    assert secret_value.encode() not in (tmp_path / database_name).read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_recorded_secret_preserves_aws_provider_binding(tmp_path: Path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'aws-recording.db').as_posix()}")
+    await database.initialize(create_schema=True)
+    fake = SecretFixturePlaywright()
+    browser = BrowserController(cast(Any, fake), database)
+    engine = WorkflowEngine(database, browser)
+    skills = SkillService(database, browser, engine)
+    try:
+        assert (await skills.record_start("aws-secret-recording"))["status"] == "recording"
+        result = await browser.fill_secret(
+            "password-field",
+            SECRET_SENTINEL,
+            secret_ref="/skillwright/prod/password",
+            input_name="password",
+            provider="aws-ssm",
+            element="Password",
+        )
+        assert result.ok
+        saved = await skills.record_stop()
+        assert saved["status"] == "saved"
+
+        skill = await database.get_skill("aws-secret-recording")
+        assert skill is not None
+        binding = await database.skill_secret_binding(skill.id, "password")
+        assert binding is not None
+        assert binding.provider == "aws-ssm"
+        assert binding.secret_ref == "/skillwright/prod/password"
+        status = await skills.secret_status("aws-secret-recording")
+        assert status["secrets"] == [
+            {"input": "password", "configured": True, "provider": "aws-ssm"}
+        ]
+        assert "/skillwright/prod/password" not in json.dumps(status)
+    finally:
+        await database.close()
 
 
 @pytest.mark.asyncio

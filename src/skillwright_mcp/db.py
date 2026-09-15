@@ -34,7 +34,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from .workflow import WorkflowDefinition
 
 JsonType = JSON().with_variant(JSONB, "postgresql")
-SCHEMA_REVISION = "f24c9d0a8e11"
+SCHEMA_REVISION = "b71e2a4c9d30"
 
 
 def _now() -> datetime:
@@ -180,7 +180,7 @@ class SkillSecretBindingRow(Base):
     )
     input_name: Mapped[str] = mapped_column(String(160), nullable=False)
     provider: Mapped[str] = mapped_column(String(32), default="env", nullable=False)
-    secret_ref: Mapped[str] = mapped_column(String(128), nullable=False)
+    secret_ref: Mapped[str] = mapped_column(String(2048), nullable=False)
     updated_by_principal_id: Mapped[str | None] = mapped_column(
         ForeignKey(
             "principals.id",
@@ -393,12 +393,16 @@ class AuditEventRow(Base):
 
 
 class Database:
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, *, connect_args: dict[str, Any] | None = None) -> None:
         self.url = url
         if url.startswith("sqlite+aiosqlite:///./"):
             relative = url.removeprefix("sqlite+aiosqlite:///./")
             Path(relative).parent.mkdir(parents=True, exist_ok=True)
-        self.engine: AsyncEngine = create_async_engine(url, pool_pre_ping=True)
+        self.engine: AsyncEngine = create_async_engine(
+            url,
+            pool_pre_ping=True,
+            connect_args=connect_args or {},
+        )
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
 
     async def initialize(self, *, create_schema: bool = True) -> None:
@@ -1120,13 +1124,21 @@ class Database:
         expired_repairs: list[str] = []
         expired_approvals: list[str] = []
         async with self.sessions.begin() as session:
+            # Claim stale candidates with a conditional write rather than SELECT ... FOR UPDATE.
+            # SQLite ignores row-level FOR UPDATE locks, which allowed a heartbeat to refresh a
+            # row after stale selection but before recovery mutated it. A no-op UPDATE acquires
+            # the database/row write lock and re-evaluates the stale predicate atomically on all
+            # supported databases. If a heartbeat wins first, the row is not returned; if the
+            # reaper wins first, later heartbeat updates wait until this recovery transaction
+            # commits and then fail their ownership/status predicate as appropriate.
             result = await session.scalars(
-                select(RunRow)
+                update(RunRow)
                 .where(
                     RunRow.status.in_(["running", "repair_required", "approval_required"]),
                     (RunRow.heartbeat_at.is_(None) | (RunRow.heartbeat_at < cutoff)),
                 )
-                .with_for_update(skip_locked=True)
+                .values(heartbeat_at=RunRow.heartbeat_at)
+                .returning(RunRow)
             )
             rows = list(result.all())
             for row in rows:

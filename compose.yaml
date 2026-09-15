@@ -105,7 +105,7 @@ services:
           "CMD",
           "python",
           "-c",
-          "import socket; connection = socket.create_connection(('127.0.0.1', 8766), timeout=2); connection.close()",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/health/ready', timeout=2).read()",
         ]
       interval: 5s
       timeout: 3s

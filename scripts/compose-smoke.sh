@@ -3,6 +3,7 @@ set -eu
 
 api_url="${SKILLWRIGHT_SMOKE_API_URL:-http://127.0.0.1:8767}"
 mcp_url="${SKILLWRIGHT_SMOKE_MCP_URL:-http://127.0.0.1:8766/mcp}"
+mcp_ready_url="${SKILLWRIGHT_SMOKE_MCP_READY_URL:-http://127.0.0.1:8766/health/ready}"
 metrics_url="${SKILLWRIGHT_SMOKE_METRICS_URL:-http://127.0.0.1:9464/metrics}"
 attempts="${SKILLWRIGHT_SMOKE_ATTEMPTS:-45}"
 smoke_token="${SKILLWRIGHT_SMOKE_BEARER_TOKEN:?set SKILLWRIGHT_SMOKE_BEARER_TOKEN for the authenticated MCP smoke}"
@@ -33,6 +34,7 @@ assert_running() {
 }
 
 retry fetch_contains "$api_url/health/ready" '"status":"ready"'
+retry fetch_contains "$mcp_ready_url" '"status":"ready"'
 
 auth_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
     "$api_url/api/v1/runs/compose-smoke-missing")"

@@ -7,7 +7,7 @@ from .browser import BrowserController
 from .compiler import WorkflowCompilationError, compile_actions
 from .db import Database
 from .engine import WorkflowEngine
-from .secrets import validate_secret_ref
+from .secrets import SecretProvider, validate_secret_ref
 from .workflow import ApprovalGate, ParameterBinding, WorkflowDefinition, WorkflowInput
 
 
@@ -318,6 +318,7 @@ class SkillService:
         *,
         input_name: str,
         secret_ref: str,
+        provider: SecretProvider = "env",
         principal_id: str | None,
     ) -> dict[str, Any]:
         stored = await self.database.get_workflow_version(name)
@@ -333,13 +334,13 @@ class SkillService:
                 "input": input_name,
             }
         try:
-            normalized_ref = validate_secret_ref(secret_ref)
+            normalized_ref = validate_secret_ref(secret_ref, provider=provider)
         except ValueError as exc:
             return {"status": "invalid_secret_ref", "error": str(exc)}
         await self.database.bind_skill_secret(
             skill_id=skill.id,
             input_name=input_name,
-            provider="env",
+            provider=provider,
             secret_ref=normalized_ref,
             updated_by_principal_id=principal_id,
         )
@@ -348,13 +349,13 @@ class SkillService:
             principal_id=principal_id,
             entity_type="skill",
             entity_id=skill.id,
-            data={"input": input_name, "provider": "env", "configured": True},
+            data={"input": input_name, "provider": provider, "configured": True},
         )
         return {
             "status": "bound",
             "skill": name,
             "input": input_name,
-            "provider": "env",
+            "provider": provider,
             "configured": True,
         }
 
@@ -474,26 +475,32 @@ class SkillService:
         actions: Sequence[Any],
         principal_id: str | None,
     ) -> None:
-        seen: dict[str, str] = {}
+        seen: dict[str, tuple[str, str]] = {}
         for action in actions:
             if action.tool_name != "browser_fill_secret":
                 continue
             input_name = action.arguments.get("input_name")
             secret_ref = action.arguments.get("secret_ref")
-            if not isinstance(input_name, str) or not isinstance(secret_ref, str):
+            provider = action.arguments.get("provider", "env")
+            if (
+                not isinstance(input_name, str)
+                or not isinstance(secret_ref, str)
+                or not isinstance(provider, str)
+            ):
                 continue
             previous = seen.get(input_name)
-            if previous is not None and previous != secret_ref:
+            binding = (provider, secret_ref)
+            if previous is not None and previous != binding:
                 raise WorkflowCompilationError(
-                    f"recording uses multiple secret refs for input {input_name!r}"
+                    f"recording uses multiple secret bindings for input {input_name!r}"
                 )
-            seen[input_name] = secret_ref
-        for input_name, secret_ref in seen.items():
+            seen[input_name] = binding
+        for input_name, (provider, secret_ref) in seen.items():
             await self.database.bind_skill_secret(
                 skill_id=skill_id,
                 input_name=input_name,
-                provider="env",
-                secret_ref=validate_secret_ref(secret_ref),
+                provider=provider,
+                secret_ref=validate_secret_ref(secret_ref, provider=provider),
                 updated_by_principal_id=principal_id,
             )
 

@@ -13,3 +13,8 @@ build/
 .skillwright/
 playwright-output/
 .playwright-mcp/
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log

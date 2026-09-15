@@ -19,7 +19,11 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
-config.set_main_option("sqlalchemy.url", Settings().database_url)
+resolved_database_url = Settings().resolved_database_url()
+# Alembic stores main options in ConfigParser, where literal percent signs are interpolation
+# markers. Component-built production URLs contain percent escapes for generated passwords, so
+# double them here; ConfigParser restores the original URL when Alembic reads the option.
+config.set_main_option("sqlalchemy.url", resolved_database_url.replace("%", "%%"))
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
@@ -68,6 +72,7 @@ async def run_async_migrations() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args=Settings().resolved_database_connect_args(),
     )
 
     async with connectable.connect() as connection:
