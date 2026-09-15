@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import socket
 from contextlib import suppress
@@ -55,10 +56,18 @@ async def execute_run(run_id: str) -> dict[str, Any]:
     """Execute one persisted run in an isolated Playwright MCP/browser session."""
 
     settings = Settings()
+    run_directory_key = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
+    browser_settings = settings.model_copy(
+        update={
+            "playwright_output_dir": settings.playwright_output_dir
+            / "runs"
+            / run_directory_key
+        }
+    )
     database = Database(settings.database_url)
     await database.initialize(create_schema=False)
     authorization = AuthorizationService(database, settings)
-    playwright = PlaywrightMCPClient(settings)
+    playwright = PlaywrightMCPClient(browser_settings)
     browser = BrowserController(playwright, database)
     engine = WorkflowEngine(database, browser, authorization)
     worker_id = _worker_id()
@@ -95,21 +104,37 @@ async def execute_run(run_id: str) -> dict[str, Any]:
                 "error_type": type(exc).__name__,
                 "side_effect_state": "unknown",
             }
-            await database.update_run(
+            updated = await database.update_owned_run(
                 run_id,
+                worker_id,
+                expected_status=run.status,
                 status="failed_unknown",
                 failure_context=failure,
                 finish=True,
             )
-            return failure
+            if updated:
+                return failure
         return {
             "status": "ignored",
             "run_id": run_id,
             "reason": "run_not_owned_by_worker",
         }
     finally:
-        await browser.close()
-        await database.close()
+        try:
+            await browser.close()
+            # This marker is written only after the Playwright/MCP context has fully exited. It
+            # makes worker teardown observable and lets integration tests prove a terminal run
+            # was not reported before the AnyIO-backed stdio session actually closed.
+            finished_run = await database.get_run(run_id)
+            if finished_run is not None and finished_run.worker_id == worker_id:
+                await database.audit(
+                    "skill.run.worker_finished",
+                    entity_type="run",
+                    entity_id=run_id,
+                    data={"worker_id": worker_id},
+                )
+        finally:
+            await database.close()
 
 
 async def _wait_for_intervention(
@@ -121,31 +146,52 @@ async def _wait_for_intervention(
     worker_id: str,
 ) -> dict[str, Any]:
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(
-        settings.repair_wait_timeout_seconds,
-        settings.approval_wait_timeout_seconds,
-    )
-    while loop.time() < deadline:
+    waiting_status: str | None = None
+    deadline: float | None = None
+    while True:
         if await database.is_cancel_requested(run_id):
-            await database.update_run(
-                run_id,
-                status="cancelled",
-                failure_context=None,
-                finish=True,
-            )
-            return {"status": "cancelled", "run_id": run_id}
-
-        if not await database.heartbeat_intervention_session(run_id, worker_id):
-            run = await database.get_run(run_id)
+            cancelled = await database.request_cancel(run_id)
             return {
-                "status": run.status if run is not None else "not_found",
+                "status": cancelled.status if cancelled is not None else "not_found",
                 "run_id": run_id,
-                "reason": "intervention_session_lost",
             }
 
         run = await database.get_run(run_id)
         if run is None:
             return {"status": "not_found", "run_id": run_id}
+        if run.status not in {"repair_required", "approval_required"}:
+            return {"status": run.status, "run_id": run.id}
+
+        if waiting_status != run.status:
+            waiting_status = run.status
+            timeout_seconds = (
+                settings.repair_wait_timeout_seconds
+                if run.status == "repair_required"
+                else settings.approval_wait_timeout_seconds
+            )
+            deadline = loop.time() + timeout_seconds
+
+        if deadline is not None and loop.time() >= deadline:
+            if run.status == "approval_required":
+                await database.expire_approval_session(run_id, worker_id=worker_id)
+                status = "approval_session_expired"
+            else:
+                await database.expire_repair_session(run_id, worker_id=worker_id)
+                status = "repair_session_expired"
+            return {
+                "status": status,
+                "run_id": run_id,
+                "reason": "intervention_wait_timeout",
+            }
+
+        if not await database.heartbeat_intervention_session(run_id, worker_id):
+            latest = await database.get_run(run_id)
+            return {
+                "status": latest.status if latest is not None else "not_found",
+                "run_id": run_id,
+                "reason": "intervention_session_lost",
+            }
+
         if run.status == "repair_required":
             repair = await database.claim_pending_repair(run_id)
             if repair is not None:
@@ -163,23 +209,7 @@ async def _wait_for_intervention(
                     result = await engine.resume_waiting_run(run_id, worker_id=worker_id)
                     if result.get("status") not in {"repair_required", "approval_required"}:
                         return result
-        else:
-            return {"status": run.status, "run_id": run.id}
-
         await asyncio.sleep(settings.repair_poll_interval_seconds)
-
-    run = await database.get_run(run_id)
-    if run is not None and run.status == "approval_required":
-        await database.expire_approval_session(run_id, worker_id=worker_id)
-        status = "approval_session_expired"
-    else:
-        await database.expire_repair_session(run_id, worker_id=worker_id)
-        status = "repair_session_expired"
-    return {
-        "status": status,
-        "run_id": run_id,
-        "reason": "intervention_wait_timeout",
-    }
 
 
 def bind_execute_run_task(
@@ -370,8 +400,16 @@ class RunDispatcher:
             recovered.append(run_id)
         return recovered
 
-    async def cancel(self, run_id: str) -> dict[str, Any]:
-        row = await self.database.request_cancel(run_id)
+    async def cancel(
+        self,
+        run_id: str,
+        *,
+        actor_principal_id: str | None = None,
+    ) -> dict[str, Any]:
+        row = await self.database.request_cancel(
+            run_id,
+            actor_principal_id=actor_principal_id,
+        )
         if row is None:
             return {"status": "not_found", "run_id": run_id}
         return {

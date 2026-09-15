@@ -8,12 +8,12 @@ from dataclasses import dataclass, field
 from time import monotonic
 
 from redis.asyncio import Redis
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from .auth import AuthorizationService, BearerTokenAuthenticator
 from .browser import BrowserController
 from .config import Settings
-from .db import Database, RunRow
+from .db import SCHEMA_REVISION, Database, RunRow
 from .engine import WorkflowEngine
 from .playwright import PlaywrightMCPClient
 from .queue import RunDispatcher
@@ -195,6 +195,18 @@ class Runtime:
             checks["database"] = "ok"
         except Exception:
             return checks
+
+        if not self.settings.database_auto_create_schema:
+            checks["schema"] = "unavailable"
+            try:
+                async with asyncio.timeout(self.settings.healthcheck_timeout_seconds):
+                    async with self.database.sessions() as session:
+                        revision = await session.scalar(
+                            text("SELECT version_num FROM alembic_version")
+                        )
+                checks["schema"] = "ok" if revision == SCHEMA_REVISION else "outdated"
+            except Exception:
+                return checks
 
         if self.settings.execution_backend == "redis":
             checks["redis"] = "unavailable"

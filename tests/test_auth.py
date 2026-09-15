@@ -184,6 +184,136 @@ async def test_visible_skills_are_owner_or_granted(tmp_path: Any) -> None:
 
 
 @pytest.mark.asyncio
+async def test_existing_skill_version_write_requires_atomic_edit_permission(tmp_path: Any) -> None:
+    database, _authorization = await _setup(tmp_path)
+    try:
+        alice = await database.ensure_principal("alice@example.test", "developer")
+        bob = await database.ensure_principal("bob@example.test", "developer")
+        workflow = WorkflowDefinition.model_validate(
+            {
+                "name": "owned-versioned-skill",
+                "steps": [{"op": "navigate", "url": "https://example.test/v1"}],
+            }
+        )
+        skill, first = await database.create_skill_version(
+            workflow,
+            owner_principal_id=alice.id,
+            actor_principal_id=alice.id,
+        )
+
+        changed = WorkflowDefinition.model_validate(
+            {
+                "name": workflow.name,
+                "steps": [{"op": "navigate", "url": "https://example.test/bob"}],
+            }
+        )
+        with pytest.raises(PermissionError, match="cannot edit existing skill"):
+            await database.create_skill_version(
+                changed,
+                owner_principal_id=bob.id,
+                actor_principal_id=bob.id,
+                expected_current_version=first.version,
+            )
+
+        unchanged = await database.get_skill(workflow.name)
+        assert unchanged is not None
+        assert unchanged.owner_principal_id == alice.id
+        assert unchanged.current_version == 1
+
+        await database.grant_skill_permission(skill.id, bob.id, "edit")
+        _, second = await database.create_skill_version(
+            changed,
+            owner_principal_id=bob.id,
+            actor_principal_id=bob.id,
+            expected_current_version=1,
+        )
+        assert second.version == 2
+        still_alice = await database.get_skill(workflow.name)
+        assert still_alice is not None
+        assert still_alice.owner_principal_id == alice.id
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_unowned_skill_is_not_silently_claimed_by_developer(tmp_path: Any) -> None:
+    database, _authorization = await _setup(tmp_path)
+    try:
+        developer = await database.ensure_principal("developer@example.test", "developer")
+        admin = await database.ensure_principal("legacy-admin@example.test", "admin")
+        workflow = WorkflowDefinition.model_validate(
+            {
+                "name": "legacy-unowned",
+                "steps": [{"op": "navigate", "url": "https://legacy.test"}],
+            }
+        )
+        skill, _ = await database.create_skill_version(workflow)
+        assert skill.owner_principal_id is None
+
+        with pytest.raises(PermissionError, match="cannot edit existing skill"):
+            await database.create_skill_version(
+                workflow,
+                owner_principal_id=developer.id,
+                actor_principal_id=developer.id,
+                expected_current_version=1,
+            )
+        after_developer = await database.get_skill(workflow.name)
+        assert after_developer is not None
+        assert after_developer.owner_principal_id is None
+        assert after_developer.current_version == 1
+
+        _, second = await database.create_skill_version(
+            workflow,
+            actor_principal_id=admin.id,
+            expected_current_version=1,
+        )
+        assert second.version == 2
+        after_admin = await database.get_skill(workflow.name)
+        assert after_admin is not None
+        assert after_admin.owner_principal_id is None
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_atomic_version_write_rejects_demoted_owner_and_editor(tmp_path: Any) -> None:
+    database, authorization = await _setup(tmp_path)
+    try:
+        owner = await database.ensure_principal("owner-demoted@example.test", "developer")
+        editor = await database.ensure_principal("editor-demoted@example.test", "developer")
+        workflow = WorkflowDefinition.model_validate(
+            {
+                "name": "role-sensitive-version-write",
+                "steps": [{"op": "navigate", "url": "https://example.test/v1"}],
+            }
+        )
+        skill, first = await database.create_skill_version(
+            workflow,
+            owner_principal_id=owner.id,
+            actor_principal_id=owner.id,
+        )
+        await database.grant_skill_permission(skill.id, editor.id, "edit")
+        owner = await database.set_principal_role(owner.external_key, "viewer")
+        editor = await database.set_principal_role(editor.external_key, "viewer")
+
+        assert await authorization.can_skill(owner, skill, "edit") is False
+        assert await authorization.can_skill(editor, skill, "edit") is False
+        for actor in (owner, editor):
+            with pytest.raises(PermissionError, match="cannot edit existing skill"):
+                await database.create_skill_version(
+                    workflow,
+                    actor_principal_id=actor.id,
+                    expected_current_version=first.version,
+                )
+
+        stored = await database.get_skill(workflow.name)
+        assert stored is not None
+        assert stored.current_version == first.version
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
 async def test_permission_revoked_after_queue_prevents_browser_work(tmp_path: Any) -> None:
     database, authorization = await _setup(tmp_path)
     try:

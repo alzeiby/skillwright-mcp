@@ -473,9 +473,12 @@ async def test_secret_is_re_resolved_and_redacted_after_repair_resume(
     fake = SecretFixturePlaywright()
     browser = BrowserController(cast(Any, fake), database)
     engine = WorkflowEngine(database, browser)
+    repair_actor = await database.ensure_principal("repair-selector@example.test", "developer")
+    await database.grant_skill_permission(skill.id, repair_actor.id, "edit")
     try:
         broken = await engine.run_skill(workflow.name)
         assert broken["status"] == "repair_required"
+        assert broken["session_available"] is True
         replacement = next(
             candidate for candidate in broken["candidates"] if candidate["name"] == "Password"
         )
@@ -489,6 +492,7 @@ async def test_secret_is_re_resolved_and_redacted_after_repair_resume(
             step=int(broken["step"]),
             replacement_element_id=str(replacement["id"]),
             persist=True,
+            actor_principal_id=repair_actor.id,
         )
 
         assert repaired["status"] == "succeeded"
@@ -515,12 +519,22 @@ async def test_secret_is_re_resolved_and_redacted_after_repair_resume(
             repairs = (
                 await session.scalars(select(RepairRow).where(RepairRow.run_id == broken["run_id"]))
             ).all()
+            repair_applied_audit = await session.scalar(
+                select(AuditEventRow).where(
+                    AuditEventRow.event_type == "repair.applied",
+                    AuditEventRow.entity_id == repairs[0].id,
+                )
+            )
             versions = (
                 await session.scalars(
                     select(WorkflowVersionRow).where(WorkflowVersionRow.skill_id == skill.id)
                 )
             ).all()
         assert run is not None
+        assert len(repairs) == 1
+        assert repairs[0].requested_by_principal_id == repair_actor.id
+        assert repair_applied_audit is not None
+        assert repair_applied_audit.principal_id == repair_actor.id
         persisted = json.dumps(
             {
                 "run": _row_payload(run),

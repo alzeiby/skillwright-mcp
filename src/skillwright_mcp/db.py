@@ -19,6 +19,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
     select,
+    text,
     update,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -33,6 +34,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from .workflow import WorkflowDefinition
 
 JsonType = JSON().with_variant(JSONB, "postgresql")
+SCHEMA_REVISION = "f24c9d0a8e11"
 
 
 def _now() -> datetime:
@@ -279,8 +281,26 @@ class StepExecutionRow(Base):
 
 class RepairRow(Base):
     __tablename__ = "repairs"
+    __table_args__ = (
+        Index(
+            "uq_repairs_active_run",
+            "run_id",
+            unique=True,
+            sqlite_where=text("status IN ('pending', 'applying')"),
+            postgresql_where=text("status IN ('pending', 'applying')"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    requested_by_principal_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "principals.id",
+            ondelete="SET NULL",
+            name="fk_repairs_requested_by_principal_id",
+        ),
+        nullable=True,
+        index=True,
+    )
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
     workflow_version_id: Mapped[str] = mapped_column(
         ForeignKey("workflow_versions.id", ondelete="RESTRICT"), index=True
@@ -727,6 +747,7 @@ class Database:
         definition: WorkflowDefinition,
         *,
         owner_principal_id: str | None = None,
+        actor_principal_id: str | None = None,
         recording_id: str | None = None,
         parent_version: int | None = None,
         change_reason: str = "created",
@@ -739,15 +760,37 @@ class Database:
             if skill is None:
                 if expected_current_version not in (None, 0):
                     raise ValueError("workflow no longer exists at the expected version")
+                initial_owner_id = owner_principal_id or actor_principal_id
                 skill = SkillRow(
                     name=definition.name,
                     description=definition.description,
-                    owner_principal_id=owner_principal_id,
+                    owner_principal_id=initial_owner_id,
                 )
                 session.add(skill)
                 await session.flush()
-            elif skill.owner_principal_id is None and owner_principal_id is not None:
-                skill.owner_principal_id = owner_principal_id
+            else:
+                effective_actor_id = actor_principal_id or owner_principal_id
+                if effective_actor_id is not None:
+                    actor = await session.get(PrincipalRow, effective_actor_id)
+                    if actor is None or actor.disabled:
+                        raise PermissionError("skill version actor is unavailable")
+                    if actor.role != "admin":
+                        if actor.role != "developer":
+                            raise PermissionError(
+                                f"principal cannot edit existing skill {definition.name!r}"
+                            )
+                        if skill.owner_principal_id != actor.id:
+                            editable = await session.scalar(
+                                select(SkillPermissionRow.id).where(
+                                    SkillPermissionRow.skill_id == skill.id,
+                                    SkillPermissionRow.principal_id == actor.id,
+                                    SkillPermissionRow.permission == "edit",
+                                )
+                            )
+                            if editable is None:
+                                raise PermissionError(
+                                    f"principal cannot edit existing skill {definition.name!r}"
+                                )
             if (
                 expected_current_version is not None
                 and skill.current_version != expected_current_version
@@ -839,6 +882,15 @@ class Database:
         idempotency_key: str | None = None,
         requested_by_principal_id: str | None = None,
     ) -> RunRow:
+        def validate_existing(existing: RunRow) -> RunRow:
+            if (
+                existing.requested_by_principal_id != requested_by_principal_id
+                or existing.workflow_version_id != version.id
+                or existing.inputs != inputs
+            ):
+                raise ValueError("idempotency key was already used for a different request")
+            return existing
+
         async with self.sessions() as session:
             if idempotency_key is not None:
                 existing = await session.scalar(
@@ -848,7 +900,7 @@ class Database:
                     )
                 )
                 if existing is not None:
-                    return existing
+                    return validate_existing(existing)
             row = RunRow(
                 requested_by_principal_id=requested_by_principal_id,
                 skill_id=skill.id,
@@ -877,7 +929,7 @@ class Database:
                 )
                 if existing is None:
                     raise
-                return cast(RunRow, existing)
+                return validate_existing(cast(RunRow, existing))
             return row
 
     async def get_run(self, run_id: str) -> RunRow | None:
@@ -913,6 +965,50 @@ class Database:
                 row.heartbeat_at = _now()
             if finish:
                 row.finished_at = _now()
+
+    async def update_owned_run(
+        self,
+        run_id: str,
+        worker_id: str,
+        *,
+        expected_status: str = "running",
+        require_not_cancelled: bool = False,
+        status: str | None = None,
+        current_step: int | None = None,
+        outputs: dict[str, Any] | None = None,
+        repair_overrides: dict[str, Any] | None = None,
+        failure_context: dict[str, Any] | None = None,
+        finish: bool = False,
+        heartbeat: bool = False,
+    ) -> bool:
+        """Update a run only while the caller still owns the expected worker lease."""
+
+        values: dict[str, Any] = {"failure_context": failure_context}
+        if status is not None:
+            values["status"] = status
+        if current_step is not None:
+            values["current_step"] = current_step
+        if outputs is not None:
+            values["outputs"] = outputs
+        if repair_overrides is not None:
+            values["repair_overrides"] = repair_overrides
+        if heartbeat:
+            values["heartbeat_at"] = _now()
+        if finish:
+            values["finished_at"] = _now()
+
+        async with self.sessions.begin() as session:
+            statement = update(RunRow).where(
+                RunRow.id == run_id,
+                RunRow.worker_id == worker_id,
+                RunRow.status == expected_status,
+            )
+            if require_not_cancelled:
+                statement = statement.where(RunRow.cancel_requested.is_(False))
+            updated_id = await session.scalar(
+                statement.values(**values).returning(RunRow.id)
+            )
+            return updated_id is not None
 
     async def claim_run(self, run_id: str, worker_id: str) -> RunRow | None:
         now = _now()
@@ -955,23 +1051,72 @@ class Database:
             value = await session.scalar(select(RunRow.cancel_requested).where(RunRow.id == run_id))
             return bool(value)
 
-    async def request_cancel(self, run_id: str) -> RunRow | None:
+    async def request_cancel(
+        self,
+        run_id: str,
+        *,
+        actor_principal_id: str | None = None,
+    ) -> RunRow | None:
         async with self.sessions.begin() as session:
             row = await session.get(RunRow, run_id, with_for_update=True)
             if row is None:
                 return None
-            if row.status in {"succeeded", "failed", "cancelled", "failed_unknown"}:
+            if row.status in {
+                "succeeded",
+                "failed",
+                "cancelled",
+                "failed_unknown",
+                "rejected",
+                "repair_session_expired",
+                "approval_session_expired",
+            }:
                 return row
+            newly_requested = not row.cancel_requested
             row.cancel_requested = True
-            if row.status in {"queued", "retrying"}:
+            if row.status in {"queued", "retrying", "repair_required", "approval_required"}:
                 row.status = "cancelled"
                 row.finished_at = _now()
+                row.worker_id = None
+                pending_repairs = await session.scalars(
+                    select(RepairRow).where(
+                        RepairRow.run_id == row.id,
+                        RepairRow.status.in_(["pending", "applying"]),
+                    )
+                )
+                for repair in pending_repairs:
+                    repair.status = "cancelled"
+                    repair.validation_result = {
+                        "status": "cancelled",
+                        "run_id": row.id,
+                        "reason": "run_cancelled",
+                    }
+                    repair.completed_at = _now()
+                pending_approvals = await session.scalars(
+                    select(ApprovalRow).where(
+                        ApprovalRow.run_id == row.id,
+                        ApprovalRow.status == "pending",
+                    )
+                )
+                for approval in pending_approvals:
+                    approval.status = "cancelled"
+                    approval.decided_at = _now()
+            if newly_requested:
+                session.add(
+                    AuditEventRow(
+                        principal_id=actor_principal_id,
+                        event_type="run.cancel_requested",
+                        entity_type="run",
+                        entity_id=row.id,
+                        data={"status": row.status},
+                    )
+                )
             return row
 
     async def recover_stale_runs(self, stale_after_seconds: int) -> dict[str, list[str]]:
         cutoff = _now() - timedelta(seconds=stale_after_seconds)
         requeued: list[str] = []
         unknown: list[str] = []
+        cancelled: list[str] = []
         expired_repairs: list[str] = []
         expired_approvals: list[str] = []
         async with self.sessions.begin() as session:
@@ -985,6 +1130,39 @@ class Database:
             )
             rows = list(result.all())
             for row in rows:
+                if row.cancel_requested and row.status in {
+                    "repair_required",
+                    "approval_required",
+                }:
+                    row.status = "cancelled"
+                    row.finished_at = _now()
+                    row.worker_id = None
+                    row.failure_context = None
+                    pending_repairs = await session.scalars(
+                        select(RepairRow).where(
+                            RepairRow.run_id == row.id,
+                            RepairRow.status.in_(["pending", "applying"]),
+                        )
+                    )
+                    for repair in pending_repairs:
+                        repair.status = "cancelled"
+                        repair.validation_result = {
+                            "status": "cancelled",
+                            "run_id": row.id,
+                            "reason": "run_cancelled",
+                        }
+                        repair.completed_at = _now()
+                    pending_approvals = await session.scalars(
+                        select(ApprovalRow).where(
+                            ApprovalRow.run_id == row.id,
+                            ApprovalRow.status == "pending",
+                        )
+                    )
+                    for approval in pending_approvals:
+                        approval.status = "cancelled"
+                        approval.decided_at = _now()
+                    cancelled.append(row.id)
+                    continue
                 if row.status == "repair_required":
                     context = dict(row.failure_context or {})
                     context.update(
@@ -1034,10 +1212,10 @@ class Database:
                         approval.decided_at = _now()
                     expired_approvals.append(row.id)
                     continue
-                started_mutation = await session.scalar(
+                dispatched_mutation = await session.scalar(
                     select(BrowserActionRow.id).where(
                         BrowserActionRow.run_id == row.id,
-                        BrowserActionRow.state == "started",
+                        BrowserActionRow.source == "replay",
                         BrowserActionRow.tool_name.in_(
                             ["browser_click", "browser_fill", "browser_select"]
                         ),
@@ -1059,9 +1237,11 @@ class Database:
                         error="worker heartbeat expired before browser action outcome was recorded",
                     )
                 )
-                if started_mutation is not None or completed_mutation is not None:
+                if dispatched_mutation is not None or completed_mutation is not None:
                     row.status = "failed_unknown"
                     row.finished_at = _now()
+                    row.worker_id = None
+                    row.heartbeat_at = None
                     row.failure_context = {
                         "status": "failed_unknown",
                         "run_id": row.id,
@@ -1069,6 +1249,35 @@ class Database:
                         "side_effect_state": "unknown",
                     }
                     unknown.append(row.id)
+                elif row.cancel_requested:
+                    row.status = "cancelled"
+                    row.finished_at = _now()
+                    row.worker_id = None
+                    row.failure_context = None
+                    pending_repairs = await session.scalars(
+                        select(RepairRow).where(
+                            RepairRow.run_id == row.id,
+                            RepairRow.status.in_(["pending", "applying"]),
+                        )
+                    )
+                    for repair in pending_repairs:
+                        repair.status = "cancelled"
+                        repair.validation_result = {
+                            "status": "cancelled",
+                            "run_id": row.id,
+                            "reason": "run_cancelled",
+                        }
+                        repair.completed_at = _now()
+                    pending_approvals = await session.scalars(
+                        select(ApprovalRow).where(
+                            ApprovalRow.run_id == row.id,
+                            ApprovalRow.status == "pending",
+                        )
+                    )
+                    for approval in pending_approvals:
+                        approval.status = "cancelled"
+                        approval.decided_at = _now()
+                    cancelled.append(row.id)
                 else:
                     row.status = "queued"
                     row.worker_id = None
@@ -1082,6 +1291,7 @@ class Database:
         return {
             "requeued": requeued,
             "failed_unknown": unknown,
+            "cancelled": cancelled,
             "repair_session_expired": expired_repairs,
             "approval_session_expired": expired_approvals,
         }
@@ -1106,8 +1316,21 @@ class Database:
         result: dict[str, Any] | None,
         error: str | None,
         duration_ms: float,
-    ) -> StepExecutionRow:
+        worker_id: str | None = None,
+    ) -> StepExecutionRow | None:
         async with self.sessions.begin() as session:
+            if worker_id is not None:
+                owned_run = await session.scalar(
+                    select(RunRow.id)
+                    .where(
+                        RunRow.id == run_id,
+                        RunRow.worker_id == worker_id,
+                        RunRow.status == "running",
+                    )
+                    .with_for_update()
+                )
+                if owned_run is None:
+                    return None
             row = StepExecutionRow(
                 run_id=run_id,
                 step_index=step_index,
@@ -1134,21 +1357,55 @@ class Database:
         candidate_id: str,
         persist_version: bool = True,
         status: str = "pending",
-    ) -> RepairRow:
-        async with self.sessions.begin() as session:
-            row = RepairRow(
-                run_id=run_id,
-                workflow_version_id=workflow_version_id,
-                step_index=step_index,
-                expected_target=expected_target,
-                replacement_target=replacement_target,
-                candidate_id=candidate_id,
-                persist_version=persist_version,
-                status=status,
+        requested_by_principal_id: str | None = None,
+    ) -> tuple[RepairRow, bool]:
+        async def active_repair(session: Any) -> RepairRow | None:
+            return cast(
+                RepairRow | None,
+                await session.scalar(
+                    select(RepairRow)
+                    .where(
+                        RepairRow.run_id == run_id,
+                        RepairRow.status.in_(["pending", "applying"]),
+                    )
+                    .order_by(RepairRow.created_at)
+                    .limit(1)
+                ),
             )
-            session.add(row)
-            await session.flush()
-            return row
+
+        try:
+            async with self.sessions.begin() as session:
+                # Serialize proposals on the parent run in PostgreSQL. The partial unique index
+                # below is still authoritative and closes the race for engines (notably SQLite)
+                # where SELECT FOR UPDATE cannot provide the same row-locking semantics.
+                run = await session.get(RunRow, run_id, with_for_update=True)
+                if run is None:
+                    raise KeyError(f"run not found: {run_id}")
+                if run.cancel_requested or run.status != "repair_required":
+                    raise ValueError(f"run is not awaiting repair (status {run.status!r})")
+                existing = await active_repair(session)
+                if existing is not None:
+                    return existing, False
+                row = RepairRow(
+                    requested_by_principal_id=requested_by_principal_id,
+                    run_id=run_id,
+                    workflow_version_id=workflow_version_id,
+                    step_index=step_index,
+                    expected_target=expected_target,
+                    replacement_target=replacement_target,
+                    candidate_id=candidate_id,
+                    persist_version=persist_version,
+                    status=status,
+                )
+                session.add(row)
+                await session.flush()
+                return row, True
+        except IntegrityError:
+            async with self.sessions() as session:
+                existing = await active_repair(session)
+                if existing is None:
+                    raise
+                return existing, False
 
     async def get_repair(self, repair_id: str) -> RepairRow | None:
         async with self.sessions() as session:
@@ -1244,30 +1501,45 @@ class Database:
         comment: str | None = None,
     ) -> ApprovalRow:
         async with self.sessions.begin() as session:
+            initial = await session.get(ApprovalRow, approval_id)
+            if initial is None:
+                raise KeyError(f"approval not found: {approval_id}")
+            # Cancellation locks runs before closing pending intervention rows. Preserve that
+            # order here so an approval decision racing cancellation cannot deadlock on
+            # approval -> run versus run -> approval locks.
+            run = await session.get(RunRow, initial.run_id, with_for_update=True)
+            if run is None:
+                raise ValueError("approval run no longer exists")
             row = await session.get(ApprovalRow, approval_id, with_for_update=True)
             if row is None:
                 raise KeyError(f"approval not found: {approval_id}")
             desired = "approved" if approve else "rejected"
+            if run.cancel_requested or run.status in {
+                "cancelled",
+                "repair_session_expired",
+                "approval_session_expired",
+            }:
+                raise ValueError(f"run is no longer actionable (status {run.status!r})")
             if row.status == desired:
                 return row
             if row.status != "pending":
                 raise ValueError(f"approval already decided with status {row.status!r}")
+            if run.cancel_requested or run.status != "approval_required":
+                raise ValueError(f"run is not awaiting approval (status {run.status!r})")
             row.status = desired
             row.decided_by_principal_id = decided_by_principal_id
             row.comment = comment
             row.decided_at = _now()
             if not approve:
-                run = await session.get(RunRow, row.run_id, with_for_update=True)
-                if run is not None and run.status == "approval_required":
-                    run.status = "rejected"
-                    run.finished_at = _now()
-                    run.failure_context = {
-                        "status": "rejected",
-                        "run_id": run.id,
-                        "approval_id": row.id,
-                        "reason": row.reason,
-                        "side_effect_state": "not_started",
-                    }
+                run.status = "rejected"
+                run.finished_at = _now()
+                run.failure_context = {
+                    "status": "rejected",
+                    "run_id": run.id,
+                    "approval_id": row.id,
+                    "reason": row.reason,
+                    "side_effect_state": "not_started",
+                }
             return row
 
     async def get_approval(self, approval_id: str) -> ApprovalRow | None:
@@ -1391,9 +1663,15 @@ class Database:
         new_workflow_version_id: str | None = None,
     ) -> None:
         async with self.sessions.begin() as session:
-            row = await session.get(RepairRow, repair_id)
+            row = await session.get(RepairRow, repair_id, with_for_update=True)
             if row is None:
                 raise KeyError(f"repair not found: {repair_id}")
+            # Cancellation and session expiry are terminal decisions made by the run state
+            # machine. A repair worker may still be unwinding a snapshot/validation call when
+            # either happens; never let that stale completion overwrite the terminal repair
+            # state.
+            if row.status not in {"pending", "applying"}:
+                return
             row.status = status
             row.validation_result = validation_result
             row.new_workflow_version_id = new_workflow_version_id

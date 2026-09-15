@@ -42,8 +42,16 @@ class PersistOnlyDispatcher:
             requested_by_principal_id=requested_by_principal_id,
         )
 
-    async def cancel(self, run_id: str) -> dict[str, Any]:
-        row = await self.runtime.database.request_cancel(run_id)
+    async def cancel(
+        self,
+        run_id: str,
+        *,
+        actor_principal_id: str | None = None,
+    ) -> dict[str, Any]:
+        row = await self.runtime.database.request_cancel(
+            run_id,
+            actor_principal_id=actor_principal_id,
+        )
         if row is None:
             return {"status": "not_found", "run_id": run_id}
         return {
@@ -157,6 +165,30 @@ async def test_control_api_create_status_cancel_uses_rbac_and_safe_run_shape(
             fetched = await client.get(f"/api/v1/runs/{run_id}")
             assert fetched.status_code == 200
             assert fetched.json() == body
+
+            exact_retry = await client.post(
+                "/api/v1/runs",
+                json={
+                    "skill": "api-smoke",
+                    "inputs": {"message": "private-value"},
+                    "idempotency_key": "api-idempotent",
+                },
+            )
+            assert exact_retry.status_code == 202
+            assert exact_retry.json()["run_id"] == run_id
+
+            conflicting_retry = await client.post(
+                "/api/v1/runs",
+                json={
+                    "skill": "api-smoke",
+                    "inputs": {"message": "different-private-value"},
+                    "idempotency_key": "api-idempotent",
+                },
+            )
+            assert conflicting_retry.status_code == 409
+            assert conflicting_retry.json()["detail"] == {"code": "idempotency_conflict"}
+            assert run_id not in conflicting_retry.text
+            assert "private-value" not in conflicting_retry.text
 
             cancelled = await client.post(f"/api/v1/runs/{run_id}/cancel")
             assert cancelled.status_code == 200
@@ -388,6 +420,14 @@ async def test_control_api_repair_and_approval_interventions_are_authorized_and_
             assert repair_audit is not None
             assert repair_audit.principal_id == principal.id
             assert repair_audit.principal_id != original_requester.id
+
+            cancelled_repair = await client.post(f"/api/v1/runs/{repair_run.id}/cancel")
+            assert cancelled_repair.status_code == 200
+            assert cancelled_repair.json()["status"] == "cancelled"
+            stored_repair = await runtime.database.get_repair(repair.json()["repair_id"])
+            assert stored_repair is not None
+            assert stored_repair.status == "cancelled"
+            assert stored_repair.completed_at is not None
 
             approval_view = await client.get(
                 f"/api/v1/runs/{approval_run.id}/intervention"

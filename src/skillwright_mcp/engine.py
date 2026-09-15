@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+from contextlib import suppress
 from copy import deepcopy
 from time import perf_counter
 from typing import Any
@@ -38,6 +40,8 @@ from .workflow import (
     WorkflowStep,
     render_template,
 )
+
+RUN_HEARTBEAT_INTERVAL_SECONDS = 5.0
 
 
 class WorkflowEngine:
@@ -123,14 +127,22 @@ class WorkflowEngine:
                     "reason": "secret_binding_invalid",
                 }
 
-        run = await self.database.create_run(
-            skill=skill,
-            version=version_row,
-            inputs=prepared_inputs,
-            status="queued",
-            idempotency_key=idempotency_key,
-            requested_by_principal_id=requested_by_principal_id,
-        )
+        try:
+            run = await self.database.create_run(
+                skill=skill,
+                version=version_row,
+                inputs=prepared_inputs,
+                status="queued",
+                idempotency_key=idempotency_key,
+                requested_by_principal_id=requested_by_principal_id,
+            )
+        except ValueError as exc:
+            if "idempotency key" not in str(exc):
+                raise
+            return {
+                "status": "idempotency_conflict",
+                "workflow": name,
+            }
         if run.status == "queued":
             await self.database.audit(
                 "skill.run.queued",
@@ -175,12 +187,19 @@ class WorkflowEngine:
         version_row = await self.database.get_workflow_version_by_id(claimed.workflow_version_id)
         skill = await self.database.get_skill_by_id(claimed.skill_id)
         if version_row is None or skill is None:
-            await self.database.update_run(
+            updated = await self.database.update_owned_run(
                 claimed.id,
+                worker_id,
                 status="failed",
                 failure_context={"reason": "workflow_version_missing"},
                 finish=True,
             )
+            if not updated:
+                return {
+                    "status": "ignored",
+                    "run_id": claimed.id,
+                    "reason": "run_ownership_lost",
+                }
             return {"status": "failed", "run_id": claimed.id, "error": "workflow version missing"}
 
         if claimed.requested_by_principal_id is not None and self.authorization is not None:
@@ -197,12 +216,19 @@ class WorkflowEngine:
                     "error": str(exc),
                     "side_effect_state": "not_started",
                 }
-                await self.database.update_run(
+                updated = await self.database.update_owned_run(
                     claimed.id,
+                    worker_id,
                     status="failed",
                     failure_context=failure,
                     finish=True,
                 )
+                if not updated:
+                    return {
+                        "status": "ignored",
+                        "run_id": claimed.id,
+                        "reason": "run_ownership_lost",
+                    }
                 await self.database.audit(
                     "skill.run.permission_denied",
                     principal_id=claimed.requested_by_principal_id,
@@ -227,12 +253,19 @@ class WorkflowEngine:
                 "reason": "secret_unavailable",
                 "side_effect_state": "not_started",
             }
-            await self.database.update_run(
+            updated = await self.database.update_owned_run(
                 claimed.id,
+                worker_id,
                 status="failed",
                 failure_context=failure,
                 finish=True,
             )
+            if not updated:
+                return {
+                    "status": "ignored",
+                    "run_id": claimed.id,
+                    "reason": "run_ownership_lost",
+                }
             await self.database.audit(
                 "skill.run.secret_unavailable",
                 principal_id=claimed.requested_by_principal_id,
@@ -298,37 +331,45 @@ class WorkflowEngine:
                 "run_id": run_id,
                 "error": f"unknown replacement element id: {replacement_element_id}",
             }
-        existing = await self.database.pending_repair(run_id)
-        if existing is not None:
-            if existing.step_index == step and existing.candidate_id == replacement_element_id:
+        version_row = await self.database.get_workflow_version_by_id(run.workflow_version_id)
+        if version_row is None:
+            return {"status": "invalid_run", "run_id": run_id, "error": "workflow version missing"}
+        replacement_target = ElementTarget.model_validate(candidate["target"])
+        try:
+            repair, created = await self.database.create_repair(
+                run_id=run.id,
+                workflow_version_id=version_row.id,
+                step_index=step,
+                expected_target=failure.get("expected", {}),
+                replacement_target=replacement_target.model_dump(mode="json"),
+                candidate_id=replacement_element_id,
+                persist_version=persist,
+                status="pending",
+                requested_by_principal_id=actor_principal_id or run.requested_by_principal_id,
+            )
+        except ValueError:
+            latest = await self.database.get_run(run.id)
+            if latest is None:
+                return {"status": "not_found", "run_id": run.id}
+            return {
+                "status": latest.status if latest.status != "repair_required" else "not_repairable",
+                "run_id": run.id,
+            }
+        if not created:
+            if repair.step_index == step and repair.candidate_id == replacement_element_id:
                 return {
                     "status": "repair_pending",
                     "run_id": run_id,
-                    "repair_id": existing.id,
+                    "repair_id": repair.id,
                     "step": step,
                     "replacement_element_id": replacement_element_id,
                 }
             return {
                 "status": "repair_conflict",
                 "run_id": run_id,
-                "repair_id": existing.id,
+                "repair_id": repair.id,
                 "error": "another repair proposal is already pending for this run",
             }
-
-        version_row = await self.database.get_workflow_version_by_id(run.workflow_version_id)
-        if version_row is None:
-            return {"status": "invalid_run", "run_id": run_id, "error": "workflow version missing"}
-        replacement_target = ElementTarget.model_validate(candidate["target"])
-        repair = await self.database.create_repair(
-            run_id=run.id,
-            workflow_version_id=version_row.id,
-            step_index=step,
-            expected_target=failure.get("expected", {}),
-            replacement_target=replacement_target.model_dump(mode="json"),
-            candidate_id=replacement_element_id,
-            persist_version=persist,
-            status="pending",
-        )
         await self.database.audit(
             "repair.requested",
             principal_id=actor_principal_id or run.requested_by_principal_id,
@@ -387,12 +428,27 @@ class WorkflowEngine:
                 "reason": "secret_unavailable",
                 "side_effect_state": "not_started",
             }
-            await self.database.update_run(
+            if worker_id is None:
+                await self.database.update_run(
+                    run.id,
+                    status="failed",
+                    failure_context=result,
+                    finish=True,
+                )
+            elif not await self.database.update_owned_run(
                 run.id,
+                worker_id,
+                expected_status="repair_required",
+                require_not_cancelled=True,
                 status="failed",
                 failure_context=result,
                 finish=True,
-            )
+            ):
+                latest = await self.database.get_run(run.id)
+                return {
+                    "status": latest.status if latest is not None else "not_found",
+                    "run_id": run.id,
+                }
             await self.database.complete_repair(
                 repair.id,
                 status="run_incomplete",
@@ -417,7 +473,7 @@ class WorkflowEngine:
         validation_snapshot_result = await self.browser.snapshot(
             source="repair",
             run_id=run.id,
-            actor_principal_id=run.requested_by_principal_id,
+            actor_principal_id=repair.requested_by_principal_id or run.requested_by_principal_id,
             redactor=redactor,
         )
         if not validation_snapshot_result.ok or validation_snapshot_result.result is None:
@@ -456,6 +512,26 @@ class WorkflowEngine:
                 update={"locator": generated_locator}
             )
 
+        # Cancellation can race the live validation call above. request_cancel() marks the
+        # run and repair terminal before returning; re-check here so this worker never reopens
+        # a cancelled run merely to discover the cancel flag at the next step boundary.
+        latest_run = await self.database.get_run(run.id)
+        if latest_run is not None and (
+            latest_run.cancel_requested or latest_run.status == "cancelled"
+        ):
+            result = {
+                "status": "cancelled",
+                "run_id": run.id,
+                "repair_id": repair.id,
+                "side_effect_state": "not_started",
+            }
+            await self.database.complete_repair(
+                repair.id,
+                status="cancelled",
+                validation_result=result,
+            )
+            return result
+
         version_row = await self.database.get_workflow_version_by_id(run.workflow_version_id)
         skill = await self.database.get_skill_by_id(run.skill_id)
         if version_row is None or skill is None:
@@ -481,12 +557,35 @@ class WorkflowEngine:
                 definition["steps"][index]["target"] = target
         patched_workflow = WorkflowDefinition.model_validate(definition)
 
-        await self.database.update_run(
+        if worker_id is None:
+            await self.database.update_run(
+                run.id,
+                status="running",
+                repair_overrides=overrides,
+                failure_context=None,
+            )
+        elif not await self.database.update_owned_run(
             run.id,
+            worker_id,
+            expected_status="repair_required",
+            require_not_cancelled=True,
             status="running",
             repair_overrides=overrides,
             failure_context=None,
-        )
+            heartbeat=True,
+        ):
+            latest = await self.database.get_run(run.id)
+            result = {
+                "status": latest.status if latest is not None else "not_found",
+                "run_id": run.id,
+                "repair_id": repair.id,
+            }
+            await self.database.complete_repair(
+                repair.id,
+                status="run_incomplete",
+                validation_result=result,
+            )
+            return result
         run.repair_overrides = overrides
         run_result = await self._run_execution_segment(
             workflow=patched_workflow,
@@ -505,19 +604,24 @@ class WorkflowEngine:
             try:
                 _, new_version = await self.database.create_skill_version(
                     patched_workflow,
+                    actor_principal_id=(
+                        repair.requested_by_principal_id or run.requested_by_principal_id
+                    ),
                     parent_version=run.workflow_version,
                     change_reason=f"repair run {run.id} step {repair.step_index}",
                     expected_current_version=run.workflow_version,
                 )
                 new_version_id = new_version.id
                 run_result["saved_workflow_version"] = new_version.version
-            except ValueError as exc:
+            except (ValueError, PermissionError) as exc:
                 run_result["repair_persisted"] = False
                 run_result["repair_persist_reason"] = str(exc)
 
         repair_status = (
             "succeeded"
             if run_result["status"] == "succeeded"
+            else "cancelled"
+            if run_result["status"] == "cancelled"
             else "applied" if run_result["status"] == "repair_required" else "run_incomplete"
         )
         await self.database.complete_repair(
@@ -528,7 +632,7 @@ class WorkflowEngine:
         )
         await self.database.audit(
             "repair.applied",
-            principal_id=run.requested_by_principal_id,
+            principal_id=repair.requested_by_principal_id or run.requested_by_principal_id,
             entity_type="repair",
             entity_id=repair.id,
             data={"run_id": run.id, "status": repair_status},
@@ -596,12 +700,27 @@ class WorkflowEngine:
                     "error": str(exc),
                     "side_effect_state": "not_started",
                 }
-                await self.database.update_run(
+                if worker_id is None:
+                    await self.database.update_run(
+                        run.id,
+                        status="failed",
+                        failure_context=failure,
+                        finish=True,
+                    )
+                elif not await self.database.update_owned_run(
                     run.id,
+                    worker_id,
+                    expected_status="approval_required",
+                    require_not_cancelled=True,
                     status="failed",
                     failure_context=failure,
                     finish=True,
-                )
+                ):
+                    latest = await self.database.get_run(run.id)
+                    return {
+                        "status": latest.status if latest is not None else "not_found",
+                        "run_id": run.id,
+                    }
                 return failure
 
         definition = deepcopy(version_row.definition)
@@ -619,19 +738,48 @@ class WorkflowEngine:
                 "reason": "secret_unavailable",
                 "side_effect_state": "not_started",
             }
-            await self.database.update_run(
+            if worker_id is None:
+                await self.database.update_run(
+                    run.id,
+                    status="failed",
+                    failure_context=failure,
+                    finish=True,
+                )
+            elif not await self.database.update_owned_run(
                 run.id,
+                worker_id,
+                expected_status="approval_required",
+                require_not_cancelled=True,
                 status="failed",
                 failure_context=failure,
                 finish=True,
-            )
+            ):
+                latest = await self.database.get_run(run.id)
+                return {
+                    "status": latest.status if latest is not None else "not_found",
+                    "run_id": run.id,
+                }
             return failure
-        await self.database.update_run(
+        if worker_id is None:
+            await self.database.update_run(
+                run.id,
+                status="running",
+                failure_context=None,
+            )
+        elif not await self.database.update_owned_run(
             run.id,
+            worker_id,
+            expected_status="approval_required",
+            require_not_cancelled=True,
             status="running",
             failure_context=None,
-            heartbeat=worker_id is not None,
-        )
+            heartbeat=True,
+        ):
+            latest = await self.database.get_run(run.id)
+            return {
+                "status": latest.status if latest is not None else "not_found",
+                "run_id": run.id,
+            }
         return await self._run_execution_segment(
             workflow=workflow,
             skill=skill,
@@ -685,26 +833,146 @@ class WorkflowEngine:
             record_exception=False,
             set_status_on_exception=False,
         ) as span:
-            try:
-                result = await self._execute(
-                    workflow=workflow,
-                    skill=skill,
-                    version_row=version_row,
-                    run=run,
-                    start_index=start_index,
-                    variables=variables,
-                    attempt=attempt,
-                    worker_id=worker_id,
-                    redactor=redactor,
+            heartbeat: asyncio.Task[None] | None = None
+            ownership_lost = asyncio.Event()
+            heartbeat_failure: list[BaseException] = []
+            owner_task = asyncio.current_task()
+            if worker_id is not None:
+                if owner_task is None:
+                    raise RuntimeError("workflow execution has no owning asyncio task")
+                heartbeat = asyncio.create_task(
+                    self._heartbeat_owned_run(
+                        run.id,
+                        worker_id,
+                        owner_task=owner_task,
+                        ownership_lost=ownership_lost,
+                        heartbeat_failure=heartbeat_failure,
+                    ),
+                    name=f"skillwright-run-heartbeat-{run.id}",
                 )
+            try:
+                try:
+                    result = await self._execute(
+                        workflow=workflow,
+                        skill=skill,
+                        version_row=version_row,
+                        run=run,
+                        start_index=start_index,
+                        variables=variables,
+                        attempt=attempt,
+                        worker_id=worker_id,
+                        redactor=redactor,
+                    )
+                except asyncio.CancelledError:
+                    if ownership_lost.is_set() or heartbeat_failure:
+                        current = asyncio.current_task()
+                        if current is not None:
+                            current.uncancel()
+                        if heartbeat_failure:
+                            raise RuntimeError("run heartbeat failed") from heartbeat_failure[0]
+                        result = {
+                            "status": "ignored",
+                            "run_id": run.id,
+                            "reason": "run_ownership_lost",
+                        }
+                    else:
+                        raise
                 status = str(result.get("status", "unknown"))
                 span.set_attribute("skillwright.run.status", status)
                 return result
             finally:
+                if heartbeat is not None:
+                    heartbeat.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await heartbeat
                 run_finished(
                     status=status,
                     duration_ms=(perf_counter() - started) * 1000,
                 )
+
+    async def _heartbeat_owned_run(
+        self,
+        run_id: str,
+        worker_id: str,
+        *,
+        owner_task: asyncio.Task[Any],
+        ownership_lost: asyncio.Event,
+        heartbeat_failure: list[BaseException],
+    ) -> None:
+        try:
+            while True:
+                await asyncio.sleep(RUN_HEARTBEAT_INTERVAL_SECONDS)
+                if await self.database.heartbeat_run(run_id, worker_id):
+                    continue
+                run = await self.database.get_run(run_id)
+                if run is not None and run.worker_id == worker_id and run.status != "running":
+                    return
+                ownership_lost.set()
+                owner_task.cancel()
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            heartbeat_failure.append(exc)
+            owner_task.cancel()
+
+    async def _execution_interrupted(
+        self,
+        *,
+        run: RunRow,
+        workflow: WorkflowDefinition,
+        version_row: WorkflowVersionRow,
+        index: int,
+        outputs: dict[str, Any],
+        worker_id: str | None,
+    ) -> dict[str, Any]:
+        if worker_id is None:
+            await self.database.update_run(
+                run.id,
+                status="cancelled",
+                current_step=index,
+                outputs=outputs,
+                failure_context=None,
+                finish=True,
+            )
+            return {
+                "status": "cancelled",
+                "run_id": run.id,
+                "workflow": workflow.name,
+                "workflow_version": version_row.version,
+                "steps_completed": index,
+                "outputs": outputs,
+            }
+
+        latest = await self.database.get_run(run.id)
+        if (
+            latest is not None
+            and latest.status == "running"
+            and latest.worker_id == worker_id
+            and latest.cancel_requested
+            and await self.database.update_owned_run(
+                run.id,
+                worker_id,
+                status="cancelled",
+                current_step=index,
+                outputs=outputs,
+                failure_context=None,
+                finish=True,
+            )
+        ):
+            return {
+                "status": "cancelled",
+                "run_id": run.id,
+                "workflow": workflow.name,
+                "workflow_version": version_row.version,
+                "steps_completed": index,
+                "outputs": outputs,
+            }
+        return {
+            "status": "ignored",
+            "run_id": run.id,
+            "reason": "run_ownership_lost",
+        }
 
     async def _execute(
         self,
@@ -722,31 +990,42 @@ class WorkflowEngine:
         outputs = dict(run.outputs)
         for index in range(start_index, len(workflow.steps)):
             if await self.database.is_cancel_requested(run.id):
+                return await self._execution_interrupted(
+                    run=run,
+                    workflow=workflow,
+                    version_row=version_row,
+                    index=index,
+                    outputs=outputs,
+                    worker_id=worker_id,
+                )
+            if worker_id is not None and not await self.database.heartbeat_run(run.id, worker_id):
+                return {
+                    "status": "ignored",
+                    "run_id": run.id,
+                    "reason": "run_ownership_lost",
+                }
+            step = workflow.steps[index]
+            if worker_id is None:
                 await self.database.update_run(
                     run.id,
-                    status="cancelled",
                     current_step=index,
                     outputs=outputs,
-                    failure_context=None,
-                    finish=True,
                 )
-                return {
-                    "status": "cancelled",
-                    "run_id": run.id,
-                    "workflow": workflow.name,
-                    "workflow_version": version_row.version,
-                    "steps_completed": index,
-                    "outputs": outputs,
-                }
-            if worker_id is not None:
-                await self.database.heartbeat_run(run.id, worker_id)
-            step = workflow.steps[index]
-            await self.database.update_run(
+            elif not await self.database.update_owned_run(
                 run.id,
+                worker_id,
                 current_step=index,
                 outputs=outputs,
-                heartbeat=worker_id is not None,
-            )
+                heartbeat=True,
+            ):
+                return await self._execution_interrupted(
+                    run=run,
+                    workflow=workflow,
+                    version_row=version_row,
+                    index=index,
+                    outputs=outputs,
+                    worker_id=worker_id,
+                )
             approval_gate = getattr(step, "approval", None)
             if approval_gate is not None:
                 gate_fingerprint = _approval_fingerprint(step)
@@ -791,7 +1070,7 @@ class WorkflowEngine:
                         "side_effect_state": "not_started",
                         "session_available": True,
                     }
-                    await self.database.add_step_execution(
+                    recorded = await self.database.add_step_execution(
                         run_id=run.id,
                         step_index=index,
                         attempt=attempt,
@@ -801,15 +1080,52 @@ class WorkflowEngine:
                         result={"approval_id": approval.id},
                         error=None,
                         duration_ms=0.0,
+                        worker_id=worker_id,
                     )
-                    await self.database.update_run(
+                    if worker_id is not None and recorded is None:
+                        return await self._execution_interrupted(
+                            run=run,
+                            workflow=workflow,
+                            version_row=version_row,
+                            index=index,
+                            outputs=outputs,
+                            worker_id=worker_id,
+                        )
+                    if worker_id is None:
+                        await self.database.update_run(
+                            run.id,
+                            status="approval_required",
+                            current_step=index,
+                            outputs=outputs,
+                            failure_context=context,
+                        )
+                    elif not await self.database.update_owned_run(
                         run.id,
+                        worker_id,
                         status="approval_required",
                         current_step=index,
                         outputs=outputs,
                         failure_context=context,
-                        heartbeat=worker_id is not None,
-                    )
+                        heartbeat=True,
+                    ):
+                        return await self._execution_interrupted(
+                            run=run,
+                            workflow=workflow,
+                            version_row=version_row,
+                            index=index,
+                            outputs=outputs,
+                            worker_id=worker_id,
+                        )
+                    if await self.database.is_cancel_requested(run.id):
+                        await self.database.request_cancel(run.id)
+                        return {
+                            "status": "cancelled",
+                            "run_id": run.id,
+                            "workflow": workflow.name,
+                            "workflow_version": version_row.version,
+                            "steps_completed": index,
+                            "outputs": outputs,
+                        }
                     await self.database.audit(
                         "approval.requested",
                         principal_id=run.requested_by_principal_id,
@@ -844,6 +1160,15 @@ class WorkflowEngine:
                     status=execution_status,
                     duration_ms=duration_ms,
                 )
+            if worker_id is not None and not await self.database.heartbeat_run(run.id, worker_id):
+                return await self._execution_interrupted(
+                    run=run,
+                    workflow=workflow,
+                    version_row=version_row,
+                    index=index,
+                    outputs=outputs,
+                    worker_id=worker_id,
+                )
             if execution["status"] == "repair_required":
                 failure = self._repair_context(
                     run=run,
@@ -854,7 +1179,7 @@ class WorkflowEngine:
                     snapshot=execution["snapshot"],
                     reason=execution["reason"],
                 )
-                await self.database.add_step_execution(
+                recorded = await self.database.add_step_execution(
                     run_id=run.id,
                     step_index=index,
                     attempt=attempt,
@@ -864,14 +1189,51 @@ class WorkflowEngine:
                     result=None,
                     error=execution["reason"],
                     duration_ms=duration_ms,
+                    worker_id=worker_id,
                 )
-                await self.database.update_run(
+                if worker_id is not None and recorded is None:
+                    return await self._execution_interrupted(
+                        run=run,
+                        workflow=workflow,
+                        version_row=version_row,
+                        index=index,
+                        outputs=outputs,
+                        worker_id=worker_id,
+                    )
+                if worker_id is None:
+                    await self.database.update_run(
+                        run.id,
+                        status="repair_required",
+                        current_step=index,
+                        outputs=outputs,
+                        failure_context=failure,
+                    )
+                elif not await self.database.update_owned_run(
                     run.id,
+                    worker_id,
                     status="repair_required",
                     current_step=index,
                     outputs=outputs,
                     failure_context=failure,
-                )
+                ):
+                    return await self._execution_interrupted(
+                        run=run,
+                        workflow=workflow,
+                        version_row=version_row,
+                        index=index,
+                        outputs=outputs,
+                        worker_id=worker_id,
+                    )
+                if await self.database.is_cancel_requested(run.id):
+                    await self.database.request_cancel(run.id)
+                    return {
+                        "status": "cancelled",
+                        "run_id": run.id,
+                        "workflow": workflow.name,
+                        "workflow_version": version_row.version,
+                        "steps_completed": index,
+                        "outputs": outputs,
+                    }
                 return failure
 
             if execution["status"] == "failed":
@@ -885,7 +1247,7 @@ class WorkflowEngine:
                     "error": execution["error"],
                     "side_effect_state": execution.get("side_effect_state", "not_started"),
                 }
-                await self.database.add_step_execution(
+                recorded = await self.database.add_step_execution(
                     run_id=run.id,
                     step_index=index,
                     attempt=attempt,
@@ -895,22 +1257,51 @@ class WorkflowEngine:
                     result=execution.get("result"),
                     error=execution["error"],
                     duration_ms=duration_ms,
+                    worker_id=worker_id,
                 )
-                await self.database.update_run(
+                if worker_id is not None and recorded is None:
+                    return await self._execution_interrupted(
+                        run=run,
+                        workflow=workflow,
+                        version_row=version_row,
+                        index=index,
+                        outputs=outputs,
+                        worker_id=worker_id,
+                    )
+                if worker_id is None:
+                    await self.database.update_run(
+                        run.id,
+                        status="failed",
+                        current_step=index,
+                        outputs=outputs,
+                        failure_context=failure,
+                        finish=True,
+                    )
+                elif not await self.database.update_owned_run(
                     run.id,
+                    worker_id,
+                    require_not_cancelled=True,
                     status="failed",
                     current_step=index,
                     outputs=outputs,
                     failure_context=failure,
                     finish=True,
-                )
+                ):
+                    return await self._execution_interrupted(
+                        run=run,
+                        workflow=workflow,
+                        version_row=version_row,
+                        index=index,
+                        outputs=outputs,
+                        worker_id=worker_id,
+                    )
                 return failure
 
             if "output" in execution:
                 output_name, output_value = execution["output"]
                 outputs[output_name] = output_value
                 variables[output_name] = output_value
-            await self.database.add_step_execution(
+            recorded = await self.database.add_step_execution(
                 run_id=run.id,
                 step_index=index,
                 attempt=attempt,
@@ -920,18 +1311,45 @@ class WorkflowEngine:
                 result=execution.get("result"),
                 error=None,
                 duration_ms=duration_ms,
+                worker_id=worker_id,
             )
-            if worker_id is not None:
-                await self.database.heartbeat_run(run.id, worker_id)
+            if worker_id is not None and recorded is None:
+                return await self._execution_interrupted(
+                    run=run,
+                    workflow=workflow,
+                    version_row=version_row,
+                    index=index,
+                    outputs=outputs,
+                    worker_id=worker_id,
+                )
 
-        await self.database.update_run(
+        if worker_id is None:
+            await self.database.update_run(
+                run.id,
+                status="succeeded",
+                current_step=len(workflow.steps),
+                outputs=outputs,
+                failure_context=None,
+                finish=True,
+            )
+        elif not await self.database.update_owned_run(
             run.id,
+            worker_id,
+            require_not_cancelled=True,
             status="succeeded",
             current_step=len(workflow.steps),
             outputs=outputs,
             failure_context=None,
             finish=True,
-        )
+        ):
+            return await self._execution_interrupted(
+                run=run,
+                workflow=workflow,
+                version_row=version_row,
+                index=len(workflow.steps),
+                outputs=outputs,
+                worker_id=worker_id,
+            )
         await self.database.audit(
             "skill.run.succeeded",
             principal_id=run.requested_by_principal_id,
@@ -1161,6 +1579,7 @@ class WorkflowEngine:
             "expected": target.model_dump(mode="json"),
             "page": {"url": snapshot.url, "title": snapshot.title},
             "candidates": candidates,
+            "session_available": True,
             "side_effect_state": "not_started",
         }
 

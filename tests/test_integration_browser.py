@@ -119,6 +119,7 @@ async def test_real_record_replay_failure_repair_and_versioning(
         handler.variant = "renamed_button"
         broken = await engine.run_skill("download_latest_invoice")
         assert broken["status"] == "repair_required", broken
+        assert broken["session_available"] is True
         assert broken["workflow_version"] == 1
         assert broken["operation"] == "click"
         replacement = next(

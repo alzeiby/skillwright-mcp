@@ -443,8 +443,12 @@ async def skill_parameterize(
 ) -> dict[str, Any]:
     """Replace recorded literals with typed workflow inputs and save a new version."""
 
-    await _skill(ctx, name, "edit")
-    return await _app(ctx).skills.parameterize(name, bindings)
+    principal, _ = await _skill(ctx, name, "edit")
+    return await _app(ctx).skills.parameterize(
+        name,
+        bindings,
+        actor_principal_id=principal.id,
+    )
 
 
 @mcp.tool()
@@ -503,12 +507,13 @@ async def skill_approval_set(
 ) -> dict[str, Any]:
     """Add or remove a durable approval gate on a mutating workflow step."""
 
-    await _skill(ctx, name, "edit")
+    principal, _ = await _skill(ctx, name, "edit")
     return await _app(ctx).skills.set_approval_gate(
         name,
         step=step,
         required=required,
         reason=reason,
+        actor_principal_id=principal.id,
     )
 
 
@@ -545,8 +550,11 @@ async def skill_status(run_id: str, ctx: Context[AppContext]) -> dict[str, Any]:
 async def skill_cancel(run_id: str, ctx: Context[AppContext]) -> dict[str, Any]:
     """Request cancellation of a queued or running skill execution."""
 
-    await _run(ctx, run_id, "run")
-    return await _app(ctx).dispatcher.cancel(run_id)
+    principal, _, _ = await _run(ctx, run_id, "run")
+    return await _app(ctx).dispatcher.cancel(
+        run_id,
+        actor_principal_id=principal.id,
+    )
 
 
 @mcp.tool()
@@ -596,13 +604,14 @@ async def skill_approval_decide(
         decided_by_principal_id=principal.id,
         comment=comment,
     )
-    await app.database.audit(
-        "approval.decided",
-        principal_id=principal.id,
-        entity_type="approval",
-        entity_id=approval.id,
-        data={"approve": approve, "run_id": approval.run_id},
-    )
+    if result.get("status") != "invalid_approval":
+        await app.database.audit(
+            "approval.decided",
+            principal_id=principal.id,
+            entity_type="approval",
+            entity_id=approval.id,
+            data={"approve": approve, "run_id": approval.run_id},
+        )
     return result
 
 
@@ -622,8 +631,12 @@ async def skill_rollback(
 ) -> dict[str, Any]:
     """Create a new current version whose definition matches an older skill version."""
 
-    await _skill(ctx, name, "edit")
-    return await _app(ctx).skills.rollback(name, version)
+    principal, _ = await _skill(ctx, name, "edit")
+    return await _app(ctx).skills.rollback(
+        name,
+        version,
+        actor_principal_id=principal.id,
+    )
 
 
 @mcp.tool()

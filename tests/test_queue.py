@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from sqlalchemy import select
 
 import skillwright_mcp.queue as queue_module
 from skillwright_mcp.browser import BrowserController
 from skillwright_mcp.config import Settings
-from skillwright_mcp.db import Database
+from skillwright_mcp.db import AuditEventRow, Database, RunRow
 from skillwright_mcp.engine import WorkflowEngine
 from skillwright_mcp.queue import RunDispatcher, broker, execute_run_task
 from skillwright_mcp.workflow import WorkflowDefinition
@@ -212,6 +214,7 @@ async def test_worker_exception_persists_only_error_type_and_closes_browser_sess
         execution_backend="redis",
     )
     fake = ClosingPlaywright()
+    client_settings: list[Settings] = []
     sentinel = "worker-secret-do-not-persist"
 
     async def fail_execution(
@@ -225,7 +228,12 @@ async def test_worker_exception_persists_only_error_type_and_closes_browser_sess
         raise RuntimeError(sentinel)
 
     monkeypatch.setattr(queue_module, "Settings", lambda: settings)
-    monkeypatch.setattr(queue_module, "PlaywrightMCPClient", lambda _settings: cast(Any, fake))
+
+    def build_fake_client(resolved_settings: Settings) -> Any:
+        client_settings.append(resolved_settings)
+        return fake
+
+    monkeypatch.setattr(queue_module, "PlaywrightMCPClient", build_fake_client)
     monkeypatch.setattr(WorkflowEngine, "execute_persisted_run", fail_execution)
 
     result = await queue_module.execute_run(run_id)
@@ -234,6 +242,14 @@ async def test_worker_exception_persists_only_error_type_and_closes_browser_sess
     assert result["error_type"] == "RuntimeError"
     assert sentinel not in str(result)
     assert fake.close_calls == 1
+    assert len(client_settings) == 1
+    expected_directory = (
+        settings.playwright_output_dir
+        / "runs"
+        / hashlib.sha256(run_id.encode("utf-8")).hexdigest()
+    )
+    assert client_settings[0].playwright_output_dir == expected_directory
+    assert run_id not in str(expected_directory)
 
     persisted = Database(database_url)
     try:
@@ -247,3 +263,146 @@ async def test_worker_exception_persists_only_error_type_and_closes_browser_sess
         await persisted.close()
 
     assert sentinel.encode() not in database_path.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_delivery_cannot_emit_owner_teardown_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "duplicate-worker-marker.db"
+    database_url = f"sqlite+aiosqlite:///{database_path.as_posix()}"
+    database = Database(database_url)
+    await database.initialize(create_schema=True)
+    workflow = WorkflowDefinition.model_validate(
+        {
+            "name": "duplicate-worker-marker",
+            "steps": [{"op": "navigate", "url": "about:blank"}],
+        }
+    )
+    skill, version = await database.create_skill_version(workflow)
+    run = await database.create_run(skill=skill, version=version, inputs={}, status="queued")
+    async with database.sessions.begin() as session:
+        row = await session.get(RunRow, run.id)
+        assert row is not None
+        row.status = "succeeded"
+        row.worker_id = "true-owner"
+    await database.close()
+
+    settings = Settings(
+        database_url=database_url,
+        database_auto_create_schema=False,
+        execution_backend="redis",
+    )
+    fake = ClosingPlaywright()
+
+    async def ignored_delivery(
+        _engine: WorkflowEngine,
+        run_id: str,
+        *,
+        worker_id: str,
+    ) -> dict[str, Any]:
+        return {"status": "succeeded", "run_id": run_id, "worker_id": worker_id}
+
+    monkeypatch.setattr(queue_module, "Settings", lambda: settings)
+    monkeypatch.setattr(queue_module, "PlaywrightMCPClient", lambda _settings: fake)
+    monkeypatch.setattr(WorkflowEngine, "execute_persisted_run", ignored_delivery)
+
+    result = await queue_module.execute_run(run.id)
+    assert result["status"] == "succeeded"
+    assert fake.close_calls == 1
+
+    persisted = Database(database_url)
+    try:
+        async with persisted.sessions() as session:
+            markers = (
+                await session.scalars(
+                    select(AuditEventRow).where(
+                        AuditEventRow.event_type == "skill.run.worker_finished",
+                        AuditEventRow.entity_id == run.id,
+                    )
+                )
+            ).all()
+        assert markers == []
+    finally:
+        await persisted.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_exception_cannot_overwrite_replacement_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "worker-exception-owner-race.db"
+    database_url = f"sqlite+aiosqlite:///{database_path.as_posix()}"
+    database = Database(database_url)
+    await database.initialize(create_schema=True)
+    workflow = WorkflowDefinition.model_validate(
+        {
+            "name": "worker-exception-owner-race",
+            "steps": [{"op": "navigate", "url": "about:blank"}],
+        }
+    )
+    skill, version = await database.create_skill_version(workflow)
+    run = await database.create_run(skill=skill, version=version, inputs={}, status="queued")
+    await database.close()
+
+    settings = Settings(
+        database_url=database_url,
+        database_auto_create_schema=False,
+        execution_backend="redis",
+    )
+    fake = ClosingPlaywright()
+
+    async def fail_after_claim(
+        engine: WorkflowEngine,
+        run_id: str,
+        *,
+        worker_id: str,
+    ) -> dict[str, Any]:
+        claimed = await engine.database.claim_run(run_id, worker_id)
+        assert claimed is not None
+        raise RuntimeError("stale worker crash")
+
+    original_update_owned_run = Database.update_owned_run
+    raced = False
+
+    async def replace_owner_before_failure_write(
+        self: Database,
+        run_id: str,
+        worker_id: str,
+        **kwargs: Any,
+    ) -> bool:
+        nonlocal raced
+        if kwargs.get("status") == "failed_unknown" and not raced:
+            raced = True
+            async with self.sessions.begin() as session:
+                row = await session.get(RunRow, run_id)
+                assert row is not None
+                row.status = "running"
+                row.worker_id = "replacement-owner"
+            return await original_update_owned_run(self, run_id, worker_id, **kwargs)
+        return await original_update_owned_run(self, run_id, worker_id, **kwargs)
+
+    monkeypatch.setattr(queue_module, "Settings", lambda: settings)
+    monkeypatch.setattr(queue_module, "PlaywrightMCPClient", lambda _settings: fake)
+    monkeypatch.setattr(WorkflowEngine, "execute_persisted_run", fail_after_claim)
+    monkeypatch.setattr(Database, "update_owned_run", replace_owner_before_failure_write)
+
+    result = await queue_module.execute_run(run.id)
+    assert result == {
+        "status": "ignored",
+        "run_id": run.id,
+        "reason": "run_not_owned_by_worker",
+    }
+    assert raced is True
+    assert fake.close_calls == 1
+
+    persisted = Database(database_url)
+    try:
+        stored = await persisted.get_run(run.id)
+        assert stored is not None
+        assert stored.status == "running"
+        assert stored.worker_id == "replacement-owner"
+    finally:
+        await persisted.close()

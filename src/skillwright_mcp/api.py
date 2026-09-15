@@ -30,6 +30,7 @@ _TERMINAL_RUN_STATUSES = {
     "failed",
     "failed_unknown",
     "cancelled",
+    "rejected",
     "repair_session_expired",
     "approval_session_expired",
 }
@@ -258,6 +259,11 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "secret_unavailable"},
             )
+        if result_status == "idempotency_conflict":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "idempotency_conflict"},
+            )
         if result_status == "queue_unavailable":
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -297,7 +303,10 @@ def create_app(
         runtime = _runtime(request)
         principal = await resolve_principal(request, runtime)
         before = await _authorized_run(runtime, principal, run_id, "run")
-        result = await runtime.dispatcher.cancel(run_id)
+        result = await runtime.dispatcher.cancel(
+            run_id,
+            actor_principal_id=principal.id,
+        )
         if result["status"] == "not_found":
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
