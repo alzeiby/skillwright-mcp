@@ -89,6 +89,7 @@ async def test_stale_run_requeues_only_before_mutating_browser_work(tmp_path: Pa
             "requeued": [safe.id],
             "failed_unknown": [],
             "repair_session_expired": [],
+            "approval_session_expired": [],
         }
         safe_after = await database.get_run(safe.id)
         assert safe_after is not None
@@ -124,6 +125,7 @@ async def test_stale_run_requeues_only_before_mutating_browser_work(tmp_path: Pa
             "requeued": [],
             "failed_unknown": [unsafe.id],
             "repair_session_expired": [],
+            "approval_session_expired": [],
         }
         unsafe_after = await database.get_run(unsafe.id)
         assert unsafe_after is not None
@@ -138,5 +140,38 @@ async def test_stale_run_requeues_only_before_mutating_browser_work(tmp_path: Pa
         assert stored_action is not None
         assert stored_action.state == "unknown"
         assert stored_action.success is None
+
+        waiting = await database.create_run(
+            skill=skill,
+            version=version,
+            inputs={},
+            status="queued",
+            idempotency_key="stale-approval",
+        )
+        assert await database.claim_run(waiting.id, "dead-worker") is not None
+        approval = await database.get_or_create_approval(
+            run_id=waiting.id,
+            workflow_version_id=version.id,
+            step_index=0,
+            gate_fingerprint="a" * 64,
+            reason="publish",
+            requested_by_principal_id=None,
+        )
+        async with database.sessions.begin() as session:
+            await session.execute(
+                update(RunRow)
+                .where(RunRow.id == waiting.id)
+                .values(status="approval_required", heartbeat_at=old_heartbeat)
+            )
+        recovered = await database.recover_stale_runs(60)
+        assert recovered == {
+            "requeued": [],
+            "failed_unknown": [],
+            "repair_session_expired": [],
+            "approval_session_expired": [waiting.id],
+        }
+        expired = await database.get_approval(approval.id)
+        assert expired is not None
+        assert expired.status == "session_expired"
     finally:
         await database.close()

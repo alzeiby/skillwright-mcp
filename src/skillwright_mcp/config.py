@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     worker_job_timeout_seconds: int = Field(default=300, ge=10)
     repair_wait_timeout_seconds: int = Field(default=900, ge=30)
     repair_poll_interval_seconds: float = Field(default=0.5, ge=0.1, le=10)
+    approval_wait_timeout_seconds: int = Field(default=900, ge=30)
     run_stale_after_seconds: int = Field(default=600, ge=30)
     stale_reaper_interval_seconds: int = Field(default=30, ge=5)
     playwright_command: str = "npx"

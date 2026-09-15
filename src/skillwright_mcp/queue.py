@@ -44,7 +44,7 @@ async def execute_run_task(run_id: str) -> dict[str, Any]:
     worker_id = _worker_id()
     try:
         result = await engine.execute_persisted_run(run_id, worker_id=worker_id)
-        if result.get("status") != "repair_required":
+        if result.get("status") not in {"repair_required", "approval_required"}:
             return result
 
         run = await database.get_run(run_id)
@@ -52,9 +52,9 @@ async def execute_run_task(run_id: str) -> dict[str, Any]:
             return {
                 "status": "ignored",
                 "run_id": run_id,
-                "reason": "repair_session_owned_by_other_worker",
+                "reason": "intervention_session_owned_by_other_worker",
             }
-        return await _wait_for_repair(
+        return await _wait_for_intervention(
             engine=engine,
             database=database,
             settings=settings,
@@ -65,7 +65,7 @@ async def execute_run_task(run_id: str) -> dict[str, Any]:
         run = await database.get_run(run_id)
         if (
             run is not None
-            and run.status in {"running", "repair_required"}
+            and run.status in {"running", "repair_required", "approval_required"}
             and run.worker_id == worker_id
         ):
             failure = {
@@ -93,7 +93,7 @@ async def execute_run_task(run_id: str) -> dict[str, Any]:
         await database.close()
 
 
-async def _wait_for_repair(
+async def _wait_for_intervention(
     *,
     engine: WorkflowEngine,
     database: Database,
@@ -102,7 +102,10 @@ async def _wait_for_repair(
     worker_id: str,
 ) -> dict[str, Any]:
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + settings.repair_wait_timeout_seconds
+    deadline = loop.time() + max(
+        settings.repair_wait_timeout_seconds,
+        settings.approval_wait_timeout_seconds,
+    )
     while loop.time() < deadline:
         if await database.is_cancel_requested(run_id):
             await database.update_run(
@@ -113,29 +116,50 @@ async def _wait_for_repair(
             )
             return {"status": "cancelled", "run_id": run_id}
 
-        if not await database.heartbeat_repair_session(run_id, worker_id):
+        if not await database.heartbeat_intervention_session(run_id, worker_id):
             run = await database.get_run(run_id)
             return {
                 "status": run.status if run is not None else "not_found",
                 "run_id": run_id,
-                "reason": "repair_session_lost",
+                "reason": "intervention_session_lost",
             }
 
-        repair = await database.claim_pending_repair(run_id)
-        if repair is not None:
-            result = await engine.apply_repair(repair, worker_id=worker_id)
-            if result.get("status") == "repair_validation_failed":
-                continue
-            if result.get("status") != "repair_required":
-                return result
+        run = await database.get_run(run_id)
+        if run is None:
+            return {"status": "not_found", "run_id": run_id}
+        if run.status == "repair_required":
+            repair = await database.claim_pending_repair(run_id)
+            if repair is not None:
+                result = await engine.apply_repair(repair, worker_id=worker_id)
+                if result.get("status") == "repair_validation_failed":
+                    continue
+                if result.get("status") not in {"repair_required", "approval_required"}:
+                    return result
+        elif run.status == "approval_required":
+            context = run.failure_context or {}
+            approval_id = context.get("approval_id")
+            if isinstance(approval_id, str):
+                approval = await database.get_approval(approval_id)
+                if approval is not None and approval.status == "approved":
+                    result = await engine.resume_waiting_run(run_id, worker_id=worker_id)
+                    if result.get("status") not in {"repair_required", "approval_required"}:
+                        return result
+        else:
+            return {"status": run.status, "run_id": run.id}
 
         await asyncio.sleep(settings.repair_poll_interval_seconds)
 
-    await database.expire_repair_session(run_id, worker_id=worker_id)
+    run = await database.get_run(run_id)
+    if run is not None and run.status == "approval_required":
+        await database.expire_approval_session(run_id, worker_id=worker_id)
+        status = "approval_session_expired"
+    else:
+        await database.expire_repair_session(run_id, worker_id=worker_id)
+        status = "repair_session_expired"
     return {
-        "status": "repair_session_expired",
+        "status": status,
         "run_id": run_id,
-        "reason": "repair_wait_timeout",
+        "reason": "intervention_wait_timeout",
     }
 
 
@@ -239,6 +263,37 @@ class RunDispatcher:
             replacement_element_id=replacement_element_id,
             persist=persist,
         )
+
+    async def decide_approval(
+        self,
+        approval_id: str,
+        *,
+        approve: bool,
+        decided_by_principal_id: str,
+        comment: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            approval = await self.database.decide_approval(
+                approval_id,
+                approve=approve,
+                decided_by_principal_id=decided_by_principal_id,
+                comment=comment,
+            )
+        except (KeyError, ValueError) as exc:
+            return {"status": "invalid_approval", "approval_id": approval_id, "error": str(exc)}
+        if not approve:
+            return {
+                "status": "rejected",
+                "approval_id": approval.id,
+                "run_id": approval.run_id,
+            }
+        if self.settings.execution_backend == "inline":
+            return await self.engine.resume_waiting_run(approval.run_id)
+        return {
+            "status": "approved",
+            "approval_id": approval.id,
+            "run_id": approval.run_id,
+        }
 
     async def recover_stale(self) -> dict[str, list[str]]:
         recovered = await self.database.recover_stale_runs(

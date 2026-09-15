@@ -7,7 +7,7 @@ from .browser import BrowserController
 from .compiler import WorkflowCompilationError, compile_actions
 from .db import Database
 from .engine import WorkflowEngine
-from .workflow import ParameterBinding, WorkflowDefinition, WorkflowInput
+from .workflow import ApprovalGate, ParameterBinding, WorkflowDefinition, WorkflowInput
 
 
 class SkillService:
@@ -271,6 +271,59 @@ class SkillService:
             "version": new_version.version,
             "inputs": updated.model_dump(mode="json")["inputs"],
             "workflow": updated.model_dump(mode="json"),
+        }
+
+    async def set_approval_gate(
+        self,
+        name: str,
+        *,
+        step: int,
+        required: bool,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        stored = await self.database.get_workflow_version(name)
+        if stored is None:
+            return {"status": "not_found", "skill": name}
+        skill, version = stored
+        workflow = WorkflowDefinition.model_validate(version.definition)
+        if step >= len(workflow.steps):
+            return {"status": "invalid_step", "error": f"step {step} does not exist"}
+        selected = workflow.steps[step]
+        if selected.op not in {"click", "fill", "select"}:
+            return {
+                "status": "invalid_step",
+                "error": f"approval gates are not supported for {selected.op!r} steps",
+            }
+        if required and not reason:
+            return {"status": "invalid_approval", "error": "a required gate needs a reason"}
+
+        definition = workflow.model_dump(mode="json")
+        definition["schema_version"] = 2
+        definition["steps"][step]["approval"] = (
+            ApprovalGate(reason=reason or "Approval required").model_dump(mode="json")
+            if required
+            else None
+        )
+        updated = WorkflowDefinition.model_validate(definition)
+        try:
+            _, new_version = await self.database.create_skill_version(
+                updated,
+                parent_version=version.version,
+                change_reason=(
+                    f"require approval at step {step}"
+                    if required
+                    else f"remove approval at step {step}"
+                ),
+                expected_current_version=version.version,
+            )
+        except ValueError as exc:
+            return {"status": "conflict", "error": str(exc)}
+        return {
+            "status": "saved",
+            "skill": skill.name,
+            "version": new_version.version,
+            "step": step,
+            "approval": definition["steps"][step]["approval"],
         }
 
 

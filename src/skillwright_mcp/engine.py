@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from copy import deepcopy
 from time import perf_counter
 from typing import Any
@@ -460,6 +462,73 @@ class WorkflowEngine:
             }
         return await self.apply_repair(repair)
 
+    async def resume_waiting_run(
+        self,
+        run_id: str,
+        *,
+        worker_id: str | None = None,
+    ) -> dict[str, Any]:
+        run = await self.database.get_run(run_id)
+        if run is None:
+            return {"status": "not_found", "run_id": run_id}
+        if run.status != "approval_required":
+            return {"status": run.status, "run_id": run.id}
+        if worker_id is not None and run.worker_id != worker_id:
+            return {
+                "status": "ignored",
+                "run_id": run.id,
+                "reason": "approval_session_owned_by_other_worker",
+            }
+
+        version_row = await self.database.get_workflow_version_by_id(run.workflow_version_id)
+        skill = await self.database.get_skill_by_id(run.skill_id)
+        if version_row is None or skill is None:
+            return {"status": "failed", "run_id": run.id, "error": "workflow version missing"}
+        if run.requested_by_principal_id is not None and self.authorization is not None:
+            try:
+                principal = await self.authorization.principal_by_id(run.requested_by_principal_id)
+                await self.authorization.require_skill(principal, skill, "run")
+            except AuthorizationError as exc:
+                failure = {
+                    "status": "failed",
+                    "run_id": run.id,
+                    "reason": "permission_revoked_before_approved_action",
+                    "error": str(exc),
+                    "side_effect_state": "not_started",
+                }
+                await self.database.update_run(
+                    run.id,
+                    status="failed",
+                    failure_context=failure,
+                    finish=True,
+                )
+                return failure
+
+        definition = deepcopy(version_row.definition)
+        for step_key, target in run.repair_overrides.items():
+            index = int(step_key)
+            if index < len(definition["steps"]) and "target" in definition["steps"][index]:
+                definition["steps"][index]["target"] = target
+        workflow = WorkflowDefinition.model_validate(definition)
+        variables = dict(run.inputs)
+        variables.update(run.outputs)
+        await self.database.update_run(
+            run.id,
+            status="running",
+            failure_context=None,
+            heartbeat=worker_id is not None,
+        )
+        return await self._execute(
+            workflow=workflow,
+            skill=skill,
+            version_row=version_row,
+            run=run,
+            start_index=run.current_step,
+            variables=variables,
+            attempt=max(1, run.attempt_count),
+            worker_id=worker_id,
+        )
+
     async def _execute(
         self,
         *,
@@ -500,6 +569,77 @@ class WorkflowEngine:
                 outputs=outputs,
                 heartbeat=worker_id is not None,
             )
+            approval_gate = getattr(step, "approval", None)
+            if approval_gate is not None:
+                gate_fingerprint = _approval_fingerprint(step)
+                approval = await self.database.approval_for_gate(
+                    run_id=run.id,
+                    workflow_version_id=version_row.id,
+                    step_index=index,
+                    gate_fingerprint=gate_fingerprint,
+                )
+                if approval is None or approval.status != "approved":
+                    if approval is not None and approval.status == "rejected":
+                        return {
+                            "status": "rejected",
+                            "run_id": run.id,
+                            "approval_id": approval.id,
+                            "step": index,
+                            "side_effect_state": "not_started",
+                        }
+                    approval = await self.database.get_or_create_approval(
+                        run_id=run.id,
+                        workflow_version_id=version_row.id,
+                        step_index=index,
+                        gate_fingerprint=gate_fingerprint,
+                        reason=approval_gate.reason,
+                        requested_by_principal_id=run.requested_by_principal_id,
+                    )
+                    gated_target = getattr(step, "target", None)
+                    context = {
+                        "status": "approval_required",
+                        "run_id": run.id,
+                        "workflow": workflow.name,
+                        "workflow_version": version_row.version,
+                        "step": index,
+                        "operation": step.op,
+                        "approval_id": approval.id,
+                        "reason": approval.reason,
+                        "target": (
+                            gated_target.model_dump(mode="json")
+                            if isinstance(gated_target, ElementTarget)
+                            else None
+                        ),
+                        "side_effect_state": "not_started",
+                        "session_available": True,
+                    }
+                    await self.database.add_step_execution(
+                        run_id=run.id,
+                        step_index=index,
+                        attempt=attempt,
+                        status="approval_required",
+                        step=step.model_dump(mode="json"),
+                        resolved_target=None,
+                        result={"approval_id": approval.id},
+                        error=None,
+                        duration_ms=0.0,
+                    )
+                    await self.database.update_run(
+                        run.id,
+                        status="approval_required",
+                        current_step=index,
+                        outputs=outputs,
+                        failure_context=context,
+                        heartbeat=worker_id is not None,
+                    )
+                    await self.database.audit(
+                        "approval.requested",
+                        principal_id=run.requested_by_principal_id,
+                        entity_type="approval",
+                        entity_id=approval.id,
+                        data={"run_id": run.id, "step": index, "operation": step.op},
+                    )
+                    return context
             started = perf_counter()
             execution = await self._execute_step(
                 step,
@@ -857,6 +997,13 @@ def _action_outcome(action: BrowserActionResult, *, mutating: bool) -> dict[str,
         "result": action.result.as_dict() if action.result is not None else None,
         "side_effect_state": "unknown" if mutating else "not_started",
     }
+
+
+def _approval_fingerprint(step: WorkflowStep) -> str:
+    payload = step.model_dump(mode="json")
+    payload.pop("approval", None)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _resolved_element(element: SnapshotElement) -> dict[str, Any]:

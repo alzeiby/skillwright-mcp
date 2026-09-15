@@ -5,7 +5,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-WORKFLOW_SCHEMA_VERSION = 1
+WORKFLOW_SCHEMA_VERSION = 2
 _TEMPLATE_RE = re.compile(r"{{\s*([A-Za-z_][A-Za-z0-9_]*)\s*}}")
 
 
@@ -67,6 +67,10 @@ class ElementTarget(StrictModel):
         return self
 
 
+class ApprovalGate(StrictModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+
 class NavigateStep(StrictModel):
     op: Literal["navigate"] = "navigate"
     url: str
@@ -77,6 +81,7 @@ class ClickStep(StrictModel):
     target: ElementTarget
     double_click: bool = False
     button: Literal["left", "right", "middle"] = "left"
+    approval: ApprovalGate | None = None
 
 
 class FillStep(StrictModel):
@@ -84,12 +89,14 @@ class FillStep(StrictModel):
     target: ElementTarget
     value: str
     submit: bool = False
+    approval: ApprovalGate | None = None
 
 
 class SelectStep(StrictModel):
     op: Literal["select"] = "select"
     target: ElementTarget
     values: list[str]
+    approval: ApprovalGate | None = None
 
 
 class WaitStep(StrictModel):
@@ -133,7 +140,7 @@ WorkflowStep = Annotated[
 
 
 class WorkflowDefinition(StrictModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 2
     name: str = Field(min_length=1, max_length=160)
     description: str = ""
     inputs: dict[str, WorkflowInput] = Field(default_factory=dict)

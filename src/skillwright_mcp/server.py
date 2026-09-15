@@ -374,6 +374,25 @@ async def skill_parameterize(
 
 
 @mcp.tool()
+async def skill_approval_set(
+    name: str,
+    step: int,
+    required: bool,
+    ctx: Context[AppContext],
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Add or remove a durable approval gate on a mutating workflow step."""
+
+    await _skill(ctx, name, "edit")
+    return await _app(ctx).skills.set_approval_gate(
+        name,
+        step=step,
+        required=required,
+        reason=reason,
+    )
+
+
+@mcp.tool()
 async def skill_run(
     name: str,
     ctx: Context[AppContext],
@@ -427,6 +446,43 @@ async def skill_repair(
         replacement_element_id=replacement_element_id,
         persist=persist,
     )
+
+
+@mcp.tool()
+async def skill_approval_decide(
+    approval_id: str,
+    approve: bool,
+    ctx: Context[AppContext],
+    comment: str | None = None,
+) -> dict[str, Any]:
+    """Approve or reject a pending gated workflow step."""
+
+    app = _app(ctx)
+    principal = await _principal(ctx)
+    approval = await app.database.get_approval(approval_id)
+    if approval is None:
+        raise KeyError(f"approval not found: {approval_id}")
+    run = await app.database.get_run(approval.run_id)
+    if run is None:
+        raise KeyError(f"run not found for approval: {approval.run_id}")
+    skill = await app.database.get_skill_by_id(run.skill_id)
+    if skill is None:
+        raise KeyError(f"skill not found for approval: {approval_id}")
+    await app.authorization.require_skill(principal, skill, "approve")
+    result = await app.dispatcher.decide_approval(
+        approval_id,
+        approve=approve,
+        decided_by_principal_id=principal.id,
+        comment=comment,
+    )
+    await app.database.audit(
+        "approval.decided",
+        principal_id=principal.id,
+        entity_type="approval",
+        entity_id=approval.id,
+        data={"approve": approve, "run_id": approval.run_id},
+    )
+    return result
 
 
 @mcp.tool()

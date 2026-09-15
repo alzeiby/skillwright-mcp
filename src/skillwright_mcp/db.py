@@ -276,6 +276,54 @@ class RepairRow(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class ApprovalRow(Base):
+    __tablename__ = "approvals"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "workflow_version_id",
+            "step_index",
+            "gate_fingerprint",
+            name="uq_approval_gate_instance",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    workflow_version_id: Mapped[str] = mapped_column(
+        ForeignKey("workflow_versions.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    step_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    gate_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, index=True)
+    requested_by_principal_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "principals.id",
+            ondelete="SET NULL",
+            name="fk_approvals_requested_by_principal_id",
+        ),
+        nullable=True,
+        index=True,
+    )
+    decided_by_principal_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "principals.id",
+            ondelete="SET NULL",
+            name="fk_approvals_decided_by_principal_id",
+        ),
+        nullable=True,
+        index=True,
+    )
+    comment: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class AuditEventRow(Base):
     __tablename__ = "audit_events"
 
@@ -825,11 +873,12 @@ class Database:
         requeued: list[str] = []
         unknown: list[str] = []
         expired_repairs: list[str] = []
+        expired_approvals: list[str] = []
         async with self.sessions.begin() as session:
             result = await session.scalars(
                 select(RunRow)
                 .where(
-                    RunRow.status.in_(["running", "repair_required"]),
+                    RunRow.status.in_(["running", "repair_required", "approval_required"]),
                     (RunRow.heartbeat_at.is_(None) | (RunRow.heartbeat_at < cutoff)),
                 )
                 .with_for_update(skip_locked=True)
@@ -860,6 +909,30 @@ class Database:
                         repair.validation_result = context
                         repair.completed_at = _now()
                     expired_repairs.append(row.id)
+                    continue
+                if row.status == "approval_required":
+                    context = dict(row.failure_context or {})
+                    context.update(
+                        {
+                            "status": "approval_session_expired",
+                            "reason": "worker_heartbeat_expired_while_waiting_for_approval",
+                            "session_available": False,
+                        }
+                    )
+                    row.status = "approval_session_expired"
+                    row.finished_at = _now()
+                    row.worker_id = None
+                    row.failure_context = context
+                    pending_approvals = await session.scalars(
+                        select(ApprovalRow).where(
+                            ApprovalRow.run_id == row.id,
+                            ApprovalRow.status == "pending",
+                        )
+                    )
+                    for approval in pending_approvals:
+                        approval.status = "session_expired"
+                        approval.decided_at = _now()
+                    expired_approvals.append(row.id)
                     continue
                 started_mutation = await session.scalar(
                     select(BrowserActionRow.id).where(
@@ -910,6 +983,7 @@ class Database:
             "requeued": requeued,
             "failed_unknown": unknown,
             "repair_session_expired": expired_repairs,
+            "approval_session_expired": expired_approvals,
         }
 
     async def get_workflow_version_by_id(self, version_id: str) -> WorkflowVersionRow | None:
@@ -980,6 +1054,126 @@ class Database:
         async with self.sessions() as session:
             return cast(RepairRow | None, await session.get(RepairRow, repair_id))
 
+    async def get_or_create_approval(
+        self,
+        *,
+        run_id: str,
+        workflow_version_id: str,
+        step_index: int,
+        gate_fingerprint: str,
+        reason: str,
+        requested_by_principal_id: str | None,
+    ) -> ApprovalRow:
+        async with self.sessions() as session:
+            existing = await session.scalar(
+                select(ApprovalRow).where(
+                    ApprovalRow.run_id == run_id,
+                    ApprovalRow.workflow_version_id == workflow_version_id,
+                    ApprovalRow.step_index == step_index,
+                    ApprovalRow.gate_fingerprint == gate_fingerprint,
+                )
+            )
+            if existing is not None:
+                return existing
+            row = ApprovalRow(
+                run_id=run_id,
+                workflow_version_id=workflow_version_id,
+                step_index=step_index,
+                gate_fingerprint=gate_fingerprint,
+                reason=reason,
+                status="pending",
+                requested_by_principal_id=requested_by_principal_id,
+            )
+            session.add(row)
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                existing = await session.scalar(
+                    select(ApprovalRow).where(
+                        ApprovalRow.run_id == run_id,
+                        ApprovalRow.workflow_version_id == workflow_version_id,
+                        ApprovalRow.step_index == step_index,
+                        ApprovalRow.gate_fingerprint == gate_fingerprint,
+                    )
+                )
+                if existing is None:
+                    raise
+                return cast(ApprovalRow, existing)
+            return row
+
+    async def approval_for_gate(
+        self,
+        *,
+        run_id: str,
+        workflow_version_id: str,
+        step_index: int,
+        gate_fingerprint: str,
+    ) -> ApprovalRow | None:
+        async with self.sessions() as session:
+            return cast(
+                ApprovalRow | None,
+                await session.scalar(
+                    select(ApprovalRow).where(
+                        ApprovalRow.run_id == run_id,
+                        ApprovalRow.workflow_version_id == workflow_version_id,
+                        ApprovalRow.step_index == step_index,
+                        ApprovalRow.gate_fingerprint == gate_fingerprint,
+                    )
+                ),
+            )
+
+    async def pending_approval(self, run_id: str) -> ApprovalRow | None:
+        async with self.sessions() as session:
+            return cast(
+                ApprovalRow | None,
+                await session.scalar(
+                    select(ApprovalRow)
+                    .where(ApprovalRow.run_id == run_id, ApprovalRow.status == "pending")
+                    .order_by(ApprovalRow.created_at)
+                    .limit(1)
+                ),
+            )
+
+    async def decide_approval(
+        self,
+        approval_id: str,
+        *,
+        approve: bool,
+        decided_by_principal_id: str,
+        comment: str | None = None,
+    ) -> ApprovalRow:
+        async with self.sessions.begin() as session:
+            row = await session.get(ApprovalRow, approval_id, with_for_update=True)
+            if row is None:
+                raise KeyError(f"approval not found: {approval_id}")
+            desired = "approved" if approve else "rejected"
+            if row.status == desired:
+                return row
+            if row.status != "pending":
+                raise ValueError(f"approval already decided with status {row.status!r}")
+            row.status = desired
+            row.decided_by_principal_id = decided_by_principal_id
+            row.comment = comment
+            row.decided_at = _now()
+            if not approve:
+                run = await session.get(RunRow, row.run_id, with_for_update=True)
+                if run is not None and run.status == "approval_required":
+                    run.status = "rejected"
+                    run.finished_at = _now()
+                    run.failure_context = {
+                        "status": "rejected",
+                        "run_id": run.id,
+                        "approval_id": row.id,
+                        "reason": row.reason,
+                        "side_effect_state": "not_started",
+                    }
+            return row
+
+    async def get_approval(self, approval_id: str) -> ApprovalRow | None:
+        async with self.sessions() as session:
+            return cast(ApprovalRow | None, await session.get(ApprovalRow, approval_id))
+
     async def pending_repair(self, run_id: str) -> RepairRow | None:
         async with self.sessions() as session:
             return cast(
@@ -1007,19 +1201,22 @@ class Database:
             await session.flush()
             return row
 
-    async def heartbeat_repair_session(self, run_id: str, worker_id: str) -> bool:
+    async def heartbeat_intervention_session(self, run_id: str, worker_id: str) -> bool:
         async with self.sessions.begin() as session:
             updated_id = await session.scalar(
                 update(RunRow)
                 .where(
                     RunRow.id == run_id,
-                    RunRow.status == "repair_required",
+                    RunRow.status.in_(["repair_required", "approval_required"]),
                     RunRow.worker_id == worker_id,
                 )
                 .values(heartbeat_at=_now())
                 .returning(RunRow.id)
             )
             return updated_id is not None
+
+    async def heartbeat_repair_session(self, run_id: str, worker_id: str) -> bool:
+        return await self.heartbeat_intervention_session(run_id, worker_id)
 
     async def expire_repair_session(self, run_id: str, *, worker_id: str | None = None) -> None:
         async with self.sessions.begin() as session:
@@ -1050,6 +1247,40 @@ class Database:
                 repair.status = "session_expired"
                 repair.validation_result = context
                 repair.completed_at = _now()
+
+    async def expire_approval_session(
+        self,
+        run_id: str,
+        *,
+        worker_id: str | None = None,
+    ) -> None:
+        async with self.sessions.begin() as session:
+            row = await session.get(RunRow, run_id, with_for_update=True)
+            if row is None or row.status != "approval_required":
+                return
+            if worker_id is not None and row.worker_id != worker_id:
+                return
+            context = dict(row.failure_context or {})
+            context.update(
+                {
+                    "status": "approval_session_expired",
+                    "reason": "live_browser_session_is_no_longer_available",
+                    "session_available": False,
+                }
+            )
+            row.status = "approval_session_expired"
+            row.failure_context = context
+            row.finished_at = _now()
+            row.worker_id = None
+            pending = await session.scalars(
+                select(ApprovalRow).where(
+                    ApprovalRow.run_id == run_id,
+                    ApprovalRow.status == "pending",
+                )
+            )
+            for approval in pending:
+                approval.status = "session_expired"
+                approval.decided_at = _now()
 
     async def complete_repair(
         self,
