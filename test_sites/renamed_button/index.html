@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Skillwright Test Billing</title>
+  </head>
+  <body>
+    <main>
+      <h1>Billing</h1>
+      <label for="account">Account number</label>
+      <input id="account" name="account" autocomplete="off" />
+
+      <label for="month">Statement month</label>
+      <select id="month" name="month">
+        <option value="august">August</option>
+        <option value="september">September</option>
+      </select>
+
+      <button id="statement" type="button">View Latest Statement</button>
+      <p id="result" aria-live="polite"></p>
+    </main>
+    <script>
+      document.querySelector('#statement').addEventListener('click', () => {
+        const account = document.querySelector('#account').value;
+        const month = document.querySelector('#month').value;
+        document.querySelector('#result').textContent = `Downloaded ${month} statement for ${account}`;
+      });
+    </script>
+  </body>
+</html>

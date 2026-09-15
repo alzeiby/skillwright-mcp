@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: skillwright
+      POSTGRES_USER: skillwright
+      POSTGRES_PASSWORD: skillwright
+    ports:
+      - "127.0.0.1:54329:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U skillwright -d skillwright"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - skillwright-postgres:/var/lib/postgresql/data
+
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:63799:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - skillwright-redis:/data
+
+volumes:
+  skillwright-postgres:
+  skillwright-redis:
