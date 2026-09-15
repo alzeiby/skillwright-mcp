@@ -438,3 +438,101 @@ async def test_secret_is_re_resolved_and_redacted_after_approval_resume(
         assert all(value not in persisted for value in forbidden)
     finally:
         await database.close()
+
+
+@pytest.mark.asyncio
+async def test_secret_is_re_resolved_and_redacted_after_repair_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_secret = SECRET_SENTINEL
+    rotated_secret = "rotated! secret/%?#[]{}+value"
+    monkeypatch.setenv(SECRET_ENV_NAME, original_secret)
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'secret-repair.db').as_posix()}")
+    await database.initialize(create_schema=True)
+    workflow = WorkflowDefinition.model_validate(
+        {
+            "name": "secret-repair",
+            "inputs": {"password": {"type": "string", "secret": True}},
+            "steps": [
+                {
+                    "op": "fill",
+                    "target": {"role": "textbox", "name": "Legacy Password"},
+                    "value": "{{ password }}",
+                }
+            ],
+        }
+    )
+    skill, _ = await database.create_skill_version(workflow)
+    await database.bind_skill_secret(
+        skill_id=skill.id,
+        input_name="password",
+        secret_ref="TEST_PASSWORD",
+        updated_by_principal_id=None,
+    )
+    fake = SecretFixturePlaywright()
+    browser = BrowserController(cast(Any, fake), database)
+    engine = WorkflowEngine(database, browser)
+    try:
+        broken = await engine.run_skill(workflow.name)
+        assert broken["status"] == "repair_required"
+        replacement = next(
+            candidate for candidate in broken["candidates"] if candidate["name"] == "Password"
+        )
+        assert [tool for tool, _args in fake.calls] == ["browser_snapshot"]
+
+        # Repair must resolve the binding again instead of retaining the value seen on the
+        # failed attempt. This also exercises redaction after repair validation snapshots.
+        monkeypatch.setenv(SECRET_ENV_NAME, rotated_secret)
+        repaired = await engine.repair(
+            str(broken["run_id"]),
+            step=int(broken["step"]),
+            replacement_element_id=str(replacement["id"]),
+            persist=True,
+        )
+
+        assert repaired["status"] == "succeeded"
+        assert repaired["saved_workflow_version"] == 2
+        type_calls = [args for tool, args in fake.calls if tool == "browser_type"]
+        assert len(type_calls) == 1
+        assert type_calls[0]["text"] == rotated_secret
+
+        forbidden = _forbidden_secret_variants(original_secret) | _forbidden_secret_variants(
+            rotated_secret
+        )
+        async with database.sessions() as session:
+            run = await session.scalar(select(RunRow).where(RunRow.id == broken["run_id"]))
+            actions = (
+                await session.scalars(
+                    select(BrowserActionRow).where(BrowserActionRow.run_id == broken["run_id"])
+                )
+            ).all()
+            executions = (
+                await session.scalars(
+                    select(StepExecutionRow).where(StepExecutionRow.run_id == broken["run_id"])
+                )
+            ).all()
+            repairs = (
+                await session.scalars(select(RepairRow).where(RepairRow.run_id == broken["run_id"]))
+            ).all()
+            versions = (
+                await session.scalars(
+                    select(WorkflowVersionRow).where(WorkflowVersionRow.skill_id == skill.id)
+                )
+            ).all()
+        assert run is not None
+        persisted = json.dumps(
+            {
+                "run": _row_payload(run),
+                "actions": [_row_payload(row) for row in actions],
+                "executions": [_row_payload(row) for row in executions],
+                "repairs": [_row_payload(row) for row in repairs],
+                "versions": [_row_payload(row) for row in versions],
+            },
+            default=str,
+            sort_keys=True,
+        )
+        assert all(value not in persisted for value in forbidden)
+        assert "[REDACTED]" in persisted
+    finally:
+        await database.close()
