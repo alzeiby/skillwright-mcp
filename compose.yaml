@@ -1,0 +1,144 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: skillwright
+      POSTGRES_USER: skillwright
+      POSTGRES_PASSWORD: skillwright
+    ports:
+      - "127.0.0.1:${SKILLWRIGHT_COMPOSE_POSTGRES_PORT:-54329}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U skillwright -d skillwright"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - skillwright-postgres:/var/lib/postgresql/data
+
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${SKILLWRIGHT_COMPOSE_REDIS_PORT:-63799}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - skillwright-redis:/data
+
+  migrate:
+    profiles: ["app"]
+    build: .
+    image: skillwright-mcp:local
+    command: ["migrate"]
+    environment: &skillwright-environment
+      SKILLWRIGHT_DATABASE_URL: postgresql+asyncpg://skillwright:skillwright@postgres:5432/skillwright
+      SKILLWRIGHT_REDIS_URL: redis://redis:6379/0
+      SKILLWRIGHT_EXECUTION_BACKEND: redis
+      SKILLWRIGHT_BOOTSTRAP_ADMIN_PRINCIPAL: "${SKILLWRIGHT_BOOTSTRAP_ADMIN_PRINCIPAL:-}"
+      SKILLWRIGHT_AUTH_TOKEN_HASHES: "${SKILLWRIGHT_AUTH_TOKEN_HASHES:-{}}"
+      SKILLWRIGHT_AUTH_ISSUER_URL: "${SKILLWRIGHT_AUTH_ISSUER_URL:-https://skillwright.local}"
+      SKILLWRIGHT_MCP_RESOURCE_SERVER_URL: "${SKILLWRIGHT_MCP_RESOURCE_SERVER_URL:-http://127.0.0.1:8766/mcp}"
+      SKILLWRIGHT_ALLOW_UNAUTHENTICATED_LOCAL: "false"
+      SKILLWRIGHT_OTEL_ENABLED: "true"
+      SKILLWRIGHT_OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_METRIC_EXPORT_INTERVAL: "${OTEL_METRIC_EXPORT_INTERVAL:-5000}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    profiles: ["app"]
+    build: .
+    image: skillwright-mcp:local
+    command: ["api"]
+    init: true
+    environment:
+      <<: *skillwright-environment
+      SKILLWRIGHT_OTEL_SERVICE_NAME: skillwright-api
+    ports:
+      - "127.0.0.1:${SKILLWRIGHT_COMPOSE_API_PORT:-8767}:8767"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8767/health/ready', timeout=2).read()",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  mcp:
+    profiles: ["app"]
+    build: .
+    image: skillwright-mcp:local
+    command: ["mcp"]
+    init: true
+    shm_size: "1gb"
+    environment:
+      <<: *skillwright-environment
+      SKILLWRIGHT_OTEL_SERVICE_NAME: skillwright-mcp
+    ports:
+      - "127.0.0.1:${SKILLWRIGHT_COMPOSE_MCP_PORT:-8766}:8766"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/health/ready', timeout=2).read()",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  worker:
+    profiles: ["app"]
+    build: .
+    image: skillwright-mcp:local
+    command: ["worker"]
+    init: true
+    shm_size: "1gb"
+    environment:
+      <<: *skillwright-environment
+      SKILLWRIGHT_OTEL_SERVICE_NAME: skillwright-worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+
+  otel-collector:
+    profiles: ["app"]
+    image: otel/opentelemetry-collector-contrib:0.160.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./ops/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "127.0.0.1:${SKILLWRIGHT_COMPOSE_METRICS_PORT:-9464}:9464"
+
+volumes:
+  skillwright-postgres:
+  skillwright-redis:

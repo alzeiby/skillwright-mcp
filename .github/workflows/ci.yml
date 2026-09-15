@@ -1,0 +1,264 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.21"
+          enable-cache: true
+      - run: uv sync --frozen --all-extras
+      - run: uv run ruff check src tests alembic
+      - run: uv run mypy src/skillwright_mcp
+      - name: Validate AWS Terraform
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work/infra/aws/terraform \
+            hashicorp/terraform:1.13.5 \
+            fmt -check -recursive
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work/infra/aws/terraform \
+            hashicorp/terraform:1.13.5 \
+            init -backend=false -input=false -lockfile=readonly
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work/infra/aws/terraform \
+            hashicorp/terraform:1.13.5 \
+            validate
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work/infra/aws/terraform \
+            hashicorp/terraform:1.13.5 \
+            test -no-color
+
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.21"
+          enable-cache: true
+      - run: uv sync --frozen --all-extras
+      - run: >-
+          uv run pytest -q
+          --ignore=tests/test_integration_browser.py
+          --ignore=tests/test_services_integration.py
+
+  aws-localstack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.21"
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: Smoke Terraform and AWS secret providers against LocalStack
+        run: sh scripts/localstack-aws-smoke.sh
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: skillwright
+          POSTGRES_USER: skillwright
+          POSTGRES_PASSWORD: skillwright
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U skillwright -d skillwright"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      SKILLWRIGHT_DATABASE_URL: postgresql+asyncpg://skillwright:skillwright@127.0.0.1:5432/skillwright
+      SKILLWRIGHT_REDIS_URL: redis://127.0.0.1:6379/0
+      SKILLWRIGHT_REDIS_QUEUE_NAME: skillwright-ci-runs
+      SKILLWRIGHT_WORKER_CONCURRENCY: "2"
+      SKILLWRIGHT_INTEGRATION_SERVICES: "1"
+      SKILLWRIGHT_PLAYWRIGHT_COMMAND: ${{ github.workspace }}/scripts/playwright-mcp-offline.sh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.21"
+          enable-cache: true
+      - run: uv sync --frozen --all-extras
+      - name: Install pinned Playwright MCP and Chromium
+        run: |
+          npm install --global --omit=dev @playwright/mcp@0.0.81
+          npm_root="$(npm root --global)"
+          playwright_cli="$npm_root/@playwright/mcp/node_modules/playwright/cli.js"
+          test -f "$playwright_cli"
+          node "$playwright_cli" install --with-deps chromium
+          browser_path="$(find "$HOME/.cache/ms-playwright" -path '*/chrome-linux64/chrome' -type f -print -quit)"
+          test -x "$browser_path"
+          mcp_binary="$(command -v playwright-mcp)"
+          test -x "$mcp_binary"
+          # The MCP SDK intentionally forwards only a narrow environment allowlist to stdio
+          # children, so do not depend on Skillwright-specific env vars reaching this wrapper.
+          # Mirror the production image's fixed offline paths instead.
+          sudo ln -sf "$browser_path" /usr/local/bin/skillwright-chromium
+          sudo ln -sf "$mcp_binary" /usr/local/bin/playwright-mcp
+          chmod +x scripts/playwright-mcp-offline.sh
+      - name: Validate migrations forward and backward
+        run: |
+          uv run alembic upgrade head
+          uv run alembic downgrade a6f585d77dc1
+          uv run alembic upgrade head
+          uv run alembic check
+      - name: Start real Taskiq worker
+        run: |
+          uv run taskiq worker \
+            skillwright_mcp.queue:broker \
+            --workers 1 \
+            --max-async-tasks "$SKILLWRIGHT_WORKER_CONCURRENCY" \
+            --ack-type when_executed \
+            > /tmp/skillwright-taskiq-worker.log 2>&1 &
+          echo "$!" > /tmp/skillwright-taskiq-worker.pid
+          sleep 2
+          kill -0 "$(cat /tmp/skillwright-taskiq-worker.pid)"
+      - run: uv run pytest -q tests/test_services_integration.py
+      - name: Verify Taskiq worker stayed healthy
+        run: |
+          kill -0 "$(cat /tmp/skillwright-taskiq-worker.pid)"
+          if grep -Eq 'Exception found while executing function|Traceback \(most recent call last\)|Attempted to exit cancel scope in a different task' /tmp/skillwright-taskiq-worker.log; then
+            cat /tmp/skillwright-taskiq-worker.log
+            exit 1
+          fi
+      - name: Stop Taskiq worker and verify clean teardown
+        run: |
+          pid="$(cat /tmp/skillwright-taskiq-worker.pid)"
+          kill "$pid"
+          for _ in $(seq 1 60); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+          if kill -0 "$pid" 2>/dev/null; then
+            echo "Taskiq worker did not stop within 15 seconds"
+            cat /tmp/skillwright-taskiq-worker.log
+            kill -KILL "$pid" || true
+            exit 1
+          fi
+          if grep -Eq 'Exception found while executing function|Traceback \(most recent call last\)|Attempted to exit cancel scope in a different task' /tmp/skillwright-taskiq-worker.log; then
+            cat /tmp/skillwright-taskiq-worker.log
+            exit 1
+          fi
+      - name: Run real browser integration
+        run: uv run pytest -q tests/test_integration_browser.py
+      - if: failure()
+        run: cat /tmp/skillwright-taskiq-worker.log || true
+      - if: always()
+        run: |
+          if [ -f /tmp/skillwright-taskiq-worker.pid ]; then
+            kill "$(cat /tmp/skillwright-taskiq-worker.pid)" || true
+          fi
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose configuration
+        run: docker compose --profile app config --quiet
+      - run: docker build --tag skillwright-mcp:ci --tag skillwright-mcp:local .
+      - name: Verify non-root runtime and preinstalled browser
+        run: |
+          docker run --rm --entrypoint /bin/sh skillwright-mcp:ci -c '
+            test "$(id -u)" = "10001"
+            test ! -x /usr/local/bin/npm
+            test ! -x /usr/local/bin/npx
+            command -v playwright-mcp >/dev/null
+            test -x /usr/local/bin/skillwright-chromium
+            test -r /etc/ssl/certs/aws-rds-global-bundle.pem
+            find /ms-playwright -maxdepth 1 -type d -name "chromium*" | grep -q .
+          '
+          docker run --rm --entrypoint /opt/skillwright/bin/python skillwright-mcp:ci -c \
+            "import ssl; ssl.create_default_context(cafile='/etc/ssl/certs/aws-rds-global-bundle.pem')"
+      - name: Verify offline Playwright MCP wrapper
+        run: >-
+          docker run --rm
+          --entrypoint /usr/local/bin/skillwright-playwright-mcp
+          skillwright-mcp:ci
+          --yes @playwright/mcp@0.0.81 --help
+      - name: Launch bundled Chromium through MCP
+        run: |
+          docker run --rm -i --entrypoint /opt/skillwright/bin/python skillwright-mcp:ci - <<'PY'
+          import asyncio
+
+          from skillwright_mcp.config import Settings
+          from skillwright_mcp.playwright import PlaywrightMCPClient
+
+
+          async def main() -> None:
+              client = PlaywrightMCPClient(Settings())
+              try:
+                  result = await client.call("browser_navigate", {"url": "about:blank"})
+                  assert result.ok, result.text
+              finally:
+                  await client.close()
+
+
+          asyncio.run(main())
+          PY
+      - name: Smoke production Compose topology
+        run: |
+          smoke_token="$(openssl rand -hex 32)"
+          smoke_hash="$(printf '%s' "$smoke_token" | sha256sum | awk '{print $1}')"
+          export SKILLWRIGHT_BOOTSTRAP_ADMIN_PRINCIPAL=compose-smoke-admin
+          export SKILLWRIGHT_AUTH_TOKEN_HASHES="{\"$smoke_hash\":\"compose-smoke-admin\"}"
+          export SKILLWRIGHT_SMOKE_BEARER_TOKEN="$smoke_token"
+          docker compose --profile app up -d --no-build --wait --wait-timeout 120
+          sh scripts/compose-smoke.sh
+          docker compose --profile app ps
+      - if: failure()
+        run: docker compose --profile app logs --no-color api mcp worker migrate otel-collector
+      - if: always()
+        run: docker compose --profile app down --volumes --remove-orphans
