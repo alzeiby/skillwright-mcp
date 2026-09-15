@@ -73,6 +73,56 @@ terraform plan -out=tfplan
 terraform apply tfplan
 ```
 
+## Local Terraform / AWS validation
+
+The AWS deployment has three local validation layers. CI always runs the Terraform native test
+suite in `tests/production.tftest.hcl` with Terraform 1.13.5 and the locked AWS provider. Those
+mock-provider tests exercise production invariants and rollout preconditions without requiring AWS
+or LocalStack.
+
+The mandatory, license-free LocalStack smoke exercises real Terraform provider and boto3 calls for
+Secrets Manager and SSM:
+
+```sh
+sh scripts/localstack-aws-smoke.sh
+```
+
+The script starts an isolated LocalStack Community 4.8.1 container, then uses Terraform 1.13.5 in a container to
+apply the test-only `localstack-smoke` fixture. That fixture creates a Secrets Manager secret and an
+SSM `SecureString`. Skillwright then resolves both values through its normal boto3-backed
+`SecretResolver`, rotates both values through boto3, and resolves them again to verify that
+plaintext values are not cached. The script destroys the fixture, removes its container, and clears
+its temporary Terraform state on exit. It requires Docker, `uv`, and `curl`; no AWS account or AWS
+credentials are used. Override `SKILLWRIGHT_LOCALSTACK_IMAGE` or `SKILLWRIGHT_TERRAFORM_IMAGE` to
+test another container version.
+
+To reuse an already-running LocalStack instance, set `LOCALSTACK_ENDPOINT`, for example
+`LOCALSTACK_ENDPOINT=http://127.0.0.1:4566 sh scripts/localstack-aws-smoke.sh`. The Terraform
+container automatically rewrites local loopback endpoints to `host.docker.internal`; if your Docker
+runtime needs a different address, set `LOCALSTACK_TERRAFORM_ENDPOINT` explicitly.
+
+With a running licensed LocalStack Student/Pro AWS emulator, run the deeper production-module gate:
+
+```sh
+lstk start
+sh scripts/localstack-production-smoke.sh
+```
+
+That smoke uses the actual files in this production Terraform module. It creates an isolated VPC,
+four subnets, and ACM certificate in LocalStack, applies the production module with long-lived ECS
+service counts forced to zero, and verifies the resulting ECR, ECS, IAM, RDS, Secrets Manager, SSM,
+ElastiCache, ALB, target-group, and CloudWatch resources through boto3. It then changes only the
+migration task to a candidate image, proves an `unmigrated`/stale SSM marker blocks service rollout,
+writes the candidate marker, and proves the matching rollout plan passes without actually starting
+Fargate tasks. The script destroys only resources from its own run and does not stop a LocalStack
+emulator that you started separately. Override `LOCALSTACK_ENDPOINT`,
+`LOCALSTACK_TERRAFORM_ENDPOINT`, or `SKILLWRIGHT_TERRAFORM_IMAGE` when needed.
+
+LocalStack is a control-plane compatibility gate, not a replacement for a real AWS pre-production
+deployment. Actual Fargate task launch behavior, AWS-managed RDS/ElastiCache engine behavior and
+networking, real ALB DNS/TLS, IAM propagation, and other managed-service semantics still require a
+real AWS environment before production promotion.
+
 Build the repository Docker image, tag it with an immutable release/Git SHA, and push it to
 `ecr_repository_url`. On the first deployment, set `image_tag` to that tag while services remain
 disabled, apply Terraform to register the migration task, then run it. One way to do that is:

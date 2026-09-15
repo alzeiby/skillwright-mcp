@@ -43,6 +43,11 @@ jobs:
             -w /work/infra/aws/terraform \
             hashicorp/terraform:1.13.5 \
             validate
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work/infra/aws/terraform \
+            hashicorp/terraform:1.13.5 \
+            test -no-color
 
   unit:
     runs-on: ubuntu-latest
@@ -64,6 +69,21 @@ jobs:
           uv run pytest -q
           --ignore=tests/test_integration_browser.py
           --ignore=tests/test_services_integration.py
+
+  aws-localstack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.21"
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: Smoke Terraform and AWS secret providers against LocalStack
+        run: sh scripts/localstack-aws-smoke.sh
 
   integration:
     runs-on: ubuntu-latest
